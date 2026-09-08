@@ -79,9 +79,19 @@ static int pops_audio_port = -1;
 int sceAudioOutOpenPortPatched(int type, int len, int freq, int mode) {
 	int res = TAI_CONTINUE(int, sceAudioOutOpenPortRef, type, len, freq, mode);
 
+	/* v31 instrumentation ONLY — no control-flow change. Every port ScePspemu
+	 * asks for, and what it got. This hook (main.c:863) intercepts ScePspemu's
+	 * SceAudio import only, and fires from ScePspemu's own audio init BEFORE
+	 * InitAdrenaline()/ra_init(), so it is the one place that can show who
+	 * holds VOICE before the chime ever asks for it. */
+	debugPrintf("[RA] pspemu OpenPort type=%d len=%d freq=%d mode=%d -> 0x%08X\n",
+		type, len, freq, mode, (unsigned int)res);
+
 	// Use voice port
 	if (res == SCE_AUDIO_OUT_ERROR_PORT_FULL && type == SCE_AUDIO_OUT_PORT_TYPE_BGM) {
 		pops_audio_port = TAI_CONTINUE(int, sceAudioOutOpenPortRef, SCE_AUDIO_OUT_PORT_TYPE_VOICE, len, freq, mode);
+		debugPrintf("[RA] pspemu OpenPort BGM full -> VOICE fallback -> 0x%08X (pops_audio_port)\n",
+			(unsigned int)pops_audio_port);
 		return pops_audio_port;
 	}
 

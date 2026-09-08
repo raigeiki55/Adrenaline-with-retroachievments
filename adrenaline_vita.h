@@ -69,6 +69,7 @@ enum AdrenalineVitaCommands {
 	ADRENALINE_VITA_CMD_POWER_TICK,
 	ADRENALINE_VITA_CMD_IS_EF_ENABLED,
 	ADRENALINE_VITA_CMD_EF_DEVINFO,
+	ADRENALINE_VITA_CMD_OPEN_TROPHIES, /* value 16; append-only */
 };
 
 enum AdrenalineVitaResponse {
@@ -96,7 +97,17 @@ typedef struct {
 
 	char printbuf[1024];
 	int app_type;
+	int api_type;         /* mirrors external/psp-cfw-sdk/include/systemctrl_epi.h - was missing */
+	int fake_api_type;    /* mirrors external/psp-cfw-sdk/include/systemctrl_epi.h - was missing */
+	char iso_path[256];   /* sctrlSEGetUmdFile() at boot; "" for non-ISO launches */
+	int hardcore_mode;   /* v33: 1 = hardcore session; PSP reads it to set g_disable_plugins */
 } SceAdrenaline;
+
+/* This struct is the Vita<->PSP shared block at ADRENALINE_ADDRESS. It MUST stay
+ * byte-for-byte identical to the PSP-side definition in
+ * external/psp-cfw-sdk/include/systemctrl_epi.h, and must fit in ADRENALINE_SIZE. */
+_Static_assert(sizeof(SceAdrenaline) <= ADRENALINE_SIZE,
+	"SceAdrenaline must fit inside ADRENALINE_SIZE");
 
 enum SEUmdModes
 {

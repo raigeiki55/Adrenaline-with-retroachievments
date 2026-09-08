@@ -115,7 +115,7 @@ int sceUmdRegisterUMDCallBack(int cbid) {
 exit:
 	pspSdkSetK1(k1);
 
-	logmsg3("[DEBUG]: %s: cbid=0x%08X -> 0x%08X\n", __func__, cbid, ret);
+	logmsg("[DEBUG]: %s: cbid=0x%08X -> 0x%08X\n", __func__, cbid, ret);
 	return ret;
 }
 

@@ -1,0 +1,1 @@
+add_stub_lib(pspnodrm_helper libpspnodrm_helper.S libpspnodrm_helper)

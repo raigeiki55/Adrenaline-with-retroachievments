@@ -1,0 +1,1 @@
+add_stub_lib(pspsystemctrl_user SystemCtrlForUser.S SystemCtrlForUser)

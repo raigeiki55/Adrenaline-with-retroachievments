@@ -31,3 +31,19 @@ cef/extra/updater/psp-updatelist.txt
 user/flash0
 
 docs/book
+
+# nested git repo (psp-cfw-sdk is its own repo; we vendor its tree but not its
+# VCS metadata). NOTE: a .gitignore entry alone is NOT enough -- git detects any
+# directory containing a .git as an embedded repo and stages it as a gitlink
+# (mode 160000), which would drop all ~423 vendored SDK files from the commit.
+# The nested .git has therefore been renamed to .git-disabled so the SDK's files
+# are tracked as ordinary blobs.
+external/psp-cfw-sdk/.git
+external/psp-cfw-sdk/.git-disabled/
+
+# stray VPK / build outputs
+*.vpk
+build-*.log
+
+# editor / tooling metadata
+.serena/

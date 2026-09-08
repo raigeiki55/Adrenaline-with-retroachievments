@@ -28,6 +28,7 @@
 #include <cfwmacros.h>
 #include <pspextratypes.h>
 #include <systemctrl.h>
+#include <systemctrl_se.h>	/* sctrlSEGetUmdFile() */
 #include <systemctrl_adrenaline.h>
 
 #include <adrenaline_log.h>
@@ -104,7 +105,25 @@ void initAdrenalineInfo() {
 
 	char *filename = sceKernelInitFileName();
 	if (filename) {
-		strcpy(g_adrenaline->filename, filename);
+		/* bounded: filename is kernel-sourced but the field is a fixed 256 B */
+		strncpy(g_adrenaline->filename, filename, sizeof(g_adrenaline->filename) - 1);
+		g_adrenaline->filename[sizeof(g_adrenaline->filename) - 1] = 0;
+	}
+
+	/* Publish the real backing image path for UMD/ISO launches. For an ISO the
+	 * PSP kernel reports filename as "disc0:/PSP_GAME/SYSDIR/EBOOT.BIN", which has
+	 * no Vita-side file mapping; sctrlSEGetUmdFile() returns the actual
+	 * "ms0:/ISO/<name>.iso" (or "ms0:/__ef0__/ISO/<name>.iso") that the ISO driver
+	 * reads sectors from. Empty for PBP/homebrew launches. Safe here: we run from
+	 * PentazeminOnSystemBooted(), i.e. after systemctrl restored the rebootex
+	 * config and after the ISO driver's module_start called isoSetUmdFile(). */
+	char *umd = sctrlSEGetUmdFile();
+	if (umd && umd[0]) {
+		strncpy(g_adrenaline->iso_path, umd, sizeof(g_adrenaline->iso_path) - 1);
+		g_adrenaline->iso_path[sizeof(g_adrenaline->iso_path) - 1] = 0;
+		logmsg("[INFO]: %s: iso_path = %s\n", __func__, g_adrenaline->iso_path);
+	} else {
+		logmsg("[INFO]: %s: no umd file (non-ISO launch)\n", __func__);
 	}
 
 	g_adrenaline->app_type = sceKernelApplicationType();

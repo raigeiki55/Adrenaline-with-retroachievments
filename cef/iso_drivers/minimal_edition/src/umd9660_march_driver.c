@@ -2,7 +2,6 @@
 #include <string.h>
 
 #include <pspsdk.h>
-#include <pspumd.h>
 #include <pspkernel.h>
 #include <pspthreadman_kernel.h>
 
@@ -18,7 +17,6 @@
 #include "../bits/iso_common.h"
 
 void sceKernelSetQTGP3(void*);
-void sceUmdSetDriveStatus(int status);
 
 SceUID g_umd_sema = -1;	//data2740
 static int g_umd_file_len = 0x7FFFFFFF;	//data23D4 (sector len)
@@ -529,50 +527,6 @@ void isoSetUmdDelay(int seek, int speed, int strategy) {
 	g_umd_delay_strat = strategy;
 }
 
-int isoReopenUmdFile(void) {
-	int res = iso_open();
-	sceKernelDelayThread(20000);
-	return res;
-}
-
-int isoSwapUmdFile(const char *new_file_path, char *previous, SceSize previous_size) {
-	char old_path[MAX_ISO_PATH_SIZE] = {0};
-	memcpy(old_path, g_iso_fn, MAX_ISO_PATH_SIZE);
-	sceUmdSetDriveStatus(PSP_UMD_NOT_PRESENT | PSP_UMD_CHANGED);
-	sceKernelDelayThread(100000);
-
-	isoSetUmdFile(new_file_path);
-
-	int res = iso_open();
-	sceKernelDelayThread(20000);
-
-	if (res < 0) {
-		// reset and reopen previous filepath
-		isoSetUmdFile(old_path);
-		iso_open();
-		sceIoLseek32(g_iso_fd, 0, PSP_SEEK_SET);
-		sceKernelDelayThread(20000);
-		sceUmdSetDriveStatus(PSP_UMD_PRESENT | PSP_UMD_INITED | PSP_UMD_READY);
-		logmsg("[ERROR]: %s: Failed to swap UMD file: %s: 0x%08X\n", __func__, new_file_path, res);
-
-		return res;
-	}
-	logmsg("[INFO]: %s: UMD file swapped from `%s` to `%s`\n", __func__, old_path, new_file_path);
-
-	sceIoLseek32(g_iso_fd, 0, PSP_SEEK_SET);
-	sceUmdSetDriveStatus(PSP_UMD_PRESENT | PSP_UMD_INITED | PSP_UMD_CHANGED);
-
-	sceKernelDelayThread(20000);
-    sceUmdSetDriveStatus(PSP_UMD_PRESENT | PSP_UMD_INITED | PSP_UMD_READY | PSP_UMD_CHANGED);
-
-	// Copy if possible
-	if (previous != NULL && previous_size >= MAX_ISO_PATH_SIZE) {
-		memcpy(previous, old_path, MAX_ISO_PATH_SIZE);
-	}
-
-	return 0;
-}
-
 PspIoDrvFuncs umd9660_funcs = {
 	umd9660_init,//cB0
 	umd9660_exit,//2e8
@@ -607,7 +561,7 @@ int data2248[4] = { -1 , -1 , -1 , -1};
 int march_init() {
 	// Get ISO path
 	isoSetUmdFile(sctrlSEGetUmdFile());
-	logmsg("[INFO]: Start UMDemu File: %s\n", g_iso_fn);
+	logmsg3("[INFO] UMD File: %s\n", g_iso_fn);
 
 	int r = sceIoAddDrv( &umd9660_driver );
 	if (r < 0) {

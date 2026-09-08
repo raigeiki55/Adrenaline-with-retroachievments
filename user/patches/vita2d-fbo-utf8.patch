@@ -3,7 +3,7 @@ index 86825e3..87fdff2 100644
 --- a/libvita2d/source/utils.c
 +++ b/libvita2d/source/utils.c
 @@ -270,7 +270,7 @@ void matrix_init_perspective(float *m, float fov, float aspect, float near, floa
- 
+
  uint32_t utf8_character(const char** unicode)
  {
 -	char byte = **unicode;
@@ -11,3 +11,25 @@ index 86825e3..87fdff2 100644
  	++*unicode;
  	if (!(byte & 0x80)) {
  		return byte;
+diff --git a/libvita2d/source/vita2d_texture.c b/libvita2d/source/vita2d_texture.c
+--- a/libvita2d/source/vita2d_texture.c
++++ b/libvita2d/source/vita2d_texture.c
+@@ -288,10 +288,18 @@
+ void vita2d_free_texture(vita2d_texture *texture)
+ {
+ 	if (texture) {
++		if (texture->gxm_rtgt) {
++			sceGxmDestroyRenderTarget(texture->gxm_rtgt);
++			texture->gxm_rtgt = NULL;
++		}
++		if (texture->depth_UID) {
++			gpu_free(texture->depth_UID);
++			texture->depth_UID = 0;
++		}
+ 		if (texture->palette_UID) {
+ 			gpu_free(texture->palette_UID);
+ 		}
+ 		gpu_free(texture->data_UID);
+ 		free(texture);
+ 	}
+ }

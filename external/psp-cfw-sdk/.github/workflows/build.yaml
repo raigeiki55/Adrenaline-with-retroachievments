@@ -1,0 +1,57 @@
+name: building psp-cfw-sdk
+on: [push]
+
+env: 
+  PSPDEV: "/usr/local/pspdev"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Add pspdev/bin to path
+        run: echo "$PSPDEV/bin" >> $GITHUB_PATH
+      - name: update repo
+        run: sudo apt-get update
+
+      - name: Install deps
+        run: sudo apt-get install curl p7zip-full -y
+
+      - name: Download latest sdk/toolchain and unpack
+        run: curl -OJL https://github.com/pspdev/pspdev/releases/latest/download/pspdev-ubuntu-latest-x86_64.tar.gz && sudo tar xzvf pspdev-ubuntu-latest-x86_64.tar.gz -C /usr/local
+
+      - name: Change perms
+        run: chown $USER:$USER /usr/local/pspdev
+      
+      - name: Compile psp-cfw-sdk
+        run: make
+
+      - name: Make local dirs
+        run: mkdir -p usr/local/pspdev/psp/sdk/{lib,include} && mkdir -p usr/local/pspdev/share/psp-cfw-sdk
+
+      - name: DEBUG
+        run: pwd && ls
+
+      - name: copy libs to local dir
+        run: cp -r libs/* usr/local/pspdev/psp/sdk/lib/
+
+      - name: copy headers to local dir
+        run: cp -r include/* usr/local/pspdev/psp/sdk/include/
+
+      - name: copy build-tools to local dir
+        run: cp -r build-tools usr/local/pspdev/share/psp-cfw-sdk/
+
+      - name: Compress it up!
+        run: zip -r psp-cfw-sdk.zip ./usr
+      
+      - name: Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: latest
+          prerelease: true
+          make_latest: true
+          files: psp-cfw-sdk.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
+

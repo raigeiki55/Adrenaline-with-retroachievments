@@ -139,10 +139,22 @@ static int ksceKernelStartPreloadedModulesPatched(SceUID pid) {
 	char titleid[32];
 	ksceKernelSysrootGetProcessTitleId(pid, titleid, sizeof(titleid));
 
+	/* The result used to be discarded here. A failed load of adrenaline_user
+	 * is fatal-but-invisible: ScePspemuBuildFlash0()/InitAdrenaline() never
+	 * run and the console shows nothing but a black screen. Log the failure so
+	 * the next occurrence is diagnosable from ux0:data/adrenaline_kernel_log.txt
+	 * instead of guessed at. Only failures are logged, so the normal boot path
+	 * performs no extra I/O. */
 	if (strcmp(titleid, "main") == 0) {
-		ksceKernelLoadStartModuleForPid(pid, "ux0:app/" ADRENALINE_TITLEID "/sce_module/adrenaline_vsh.suprx", 0, NULL, 0, NULL, NULL);
+		SceUID modid = ksceKernelLoadStartModuleForPid(pid, "ux0:app/" ADRENALINE_TITLEID "/sce_module/adrenaline_vsh.suprx", 0, NULL, 0, NULL, NULL);
+		if (modid < 0) {
+			debugPrintf("adrenaline_vsh.suprx load failed for pid 0x%08X: 0x%08X\n", (unsigned int)pid, (unsigned int)modid);
+		}
 	} else if (strcmp(titleid, ADRENALINE_TITLEID) == 0) {
-		ksceKernelLoadStartModuleForPid(pid, "ux0:app/" ADRENALINE_TITLEID "/sce_module/adrenaline_user.suprx", 0, NULL, 0, NULL, NULL);
+		SceUID modid = ksceKernelLoadStartModuleForPid(pid, "ux0:app/" ADRENALINE_TITLEID "/sce_module/adrenaline_user.suprx", 0, NULL, 0, NULL, NULL);
+		if (modid < 0) {
+			debugPrintf("adrenaline_user.suprx load failed for pid 0x%08X: 0x%08X\n", (unsigned int)pid, (unsigned int)modid);
+		}
 	}
 
 	return res;

@@ -46,8 +46,6 @@ int module_start(SceSize args, void* argp) {
 
 	PatchThreadManager();
 
-	logmsg("[INFO]: Start UMDemu File: %s\n", g_iso_fn);
-
 	// ISO File Descriptor
 	int fd = -1;
 

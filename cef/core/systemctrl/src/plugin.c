@@ -186,7 +186,7 @@ static void startPlugins() {
 			} else {
 				g_plugins_loaded_mem += g_last_plugin_mem_size;
 				g_last_plugin_mem_size = 0;
-				logmsg("[INFO]: Loaded plugin: %s\n", path);
+				logmsg3("[INFO]: Loaded plugin: %s\n", path);
 			}
 		} else {
 			logmsg("[ERROR]: %s: Failed to load %s -> 0x%08X\n", __func__, path, uid);
@@ -523,6 +523,15 @@ static int ProcessPluginFile(const char* parent, const char* path, void (*enable
 }
 
 void loadPlugins() {
+	/* v33 fail-closed: defensive re-read of the hardcore field at the real
+	 * load site, in case the sceUtility_Driver branch (main.c:319) did not
+	 * fire or the pre-boot struct write was not visible here. This is also
+	 * the boot self-test: in a hardcore boot the log MUST show hardcore_mode=1.
+	 * If it shows 0, the gate is fail-open and THAT IS A BUG, not a pass. */
+	if (g_adrenaline->hardcore_mode) {
+		g_disable_plugins = 1;
+		logmsg3("[INFO]: v33 loadPlugins self-test: hardcore_mode=%d -> g_disable_plugins=1\n", g_adrenaline->hardcore_mode);
+	}
 	if (g_disable_plugins) {
 		return;
 	}

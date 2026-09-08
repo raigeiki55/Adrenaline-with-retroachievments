@@ -49,6 +49,7 @@
 #include "flashfs.h"
 #include "msfs.h"
 #include "menu.h"
+#include "ra/ra.h"
 #include "states.h"
 #include "usb.h"
 #include "utils.h"
@@ -116,7 +117,30 @@ extern int g_devctl_use_ef;
 
 extern SceInt32 sceLiveAreaUpdateFrameSync(const char *formatVer,const char *frameXmlStr,SceInt32 frameXmlLen,const char *dirpathTop,SceUInt32 flag);
 
-int __errno;
+/*
+ * DO NOT re-add `int __errno;` here.
+ *
+ * It used to live on this line as a link shim from the -nostdlib era, when this
+ * module linked no libc at all and something still emitted an undefined
+ * reference to `__errno`. Defining it as an *int variable* silenced the linker.
+ *
+ * That is a data/function type collision. In newlib, `__errno` is a FUNCTION --
+ * `int *__errno(void)` in libc.a(lib_a-errno.o) -- and it is what every
+ * `errno` expression compiles into. Because main.c.obj is a direct object file
+ * and lib_a-errno.o is only an archive member, the variable wins resolution
+ * silently: ld never extracts the archive member, so there is no duplicate
+ * symbol and no warning.
+ *
+ * Once curl/OpenSSL/newlib were linked in (smoke test, 2026-09-02) this became
+ * fatal: 198 `bl` call sites branched into a zeroed, non-executable .bss
+ * address (0x812c12c8). The first one reached at runtime -- inside
+ * curl_global_init -> ossl_init -> CONF_modules_load_file -> BIO_new_file,
+ * on the guaranteed-taken fopen-failure path -- caused a prefetch abort that
+ * killed the thread silently.
+ *
+ * `__errno` must resolve to libc.a(lib_a-errno.o). check_link_winners.sh
+ * asserts this at build time and fails the build if it ever regresses.
+ */
 
 void GetFunctions() {
 	ScePspemuDivide                     = (void *)(text_addr + 0x39F0 + 0x1);
@@ -290,7 +314,28 @@ int AdrenalineCompat(SceSize args, void *argp) {
 			// Continue, do not send response
 			continue;
 		} else if (request->cmd == ADRENALINE_VITA_CMD_LOADSTATE) {
-			LoadState(adrenaline, savestate_data);
+			if (ra_is_hardcore()) {
+				/* v32: RetroAchievements hardcore forbids loading save states.
+				 * Refuse the RAM write but COMPLETE the handshake — the PSP
+				 * side (cef/core/binary/main.c:96) spins on
+				 * vita_response == ADRENALINE_VITA_RESPONSE_LOADED, so
+				 * refusing without writing the response would wedge the PSP
+				 * world forever. Net effect: the world resumes with unchanged
+				 * RAM. The UX gate in states.c keeps this backstop from
+				 * normally being reached. SaveState above is deliberately NOT
+				 * gated — states stay creatable in hardcore (B11 asymmetry). */
+				debugPrintf("[RA] v32 LOADSTATE refused: hardcore\n");
+				/* v32: make the refusal USER-VISIBLE, not just log-only. The
+				 * status line is drawn in the Trophies-tab header from
+				 * ra_get_status_message(); ra_status_message is a file-static
+				 * in ra_client.c, so write it through the setter. This is the
+				 * backstop path (the UX gate in states.c normally prevents a
+				 * load from even being requested), so if it is ever reached
+				 * the user still sees why nothing happened. */
+				ra_set_status_message("Save state blocked by Hardcore");
+			} else {
+				LoadState(adrenaline, savestate_data);
+			}
 			adrenaline->vita_response = ADRENALINE_VITA_RESPONSE_LOADED;
 			ScePspemuWritebackCache(adrenaline, ADRENALINE_SIZE);
 
@@ -443,6 +488,14 @@ int AdrenalineCompat(SceSize args, void *argp) {
 		} else if (request->cmd == ADRENALINE_VITA_CMD_EF_DEVINFO) {
 			g_devctl_use_ef = 1;
 			res = 0;
+
+		} else if (request->cmd == ADRENALINE_VITA_CMD_OPEN_TROPHIES) {
+			// RetroAchievements trophy screen request from PSP/XMB side.
+			// Flag only: the PSP side blocks on sceKermitSendRequest until we
+			// respond, so nothing heavy may happen here. AdrenalineDraw picks
+			// the flag up and opens the Trophies tab.
+			ra_trophy_open_requested = 1;
+			res = 0;
 		}
 
 		ScePspemuKermitSendResponse(KERMIT_MODE_EXTRA_2, request, (uint64_t)res);
@@ -494,10 +547,55 @@ static int InitAdrenaline() {
 	}
 
 	// Create and start AdrenalineDraw thread
-	SceUID draw_thid = sceKernelCreateThread("AdrenalineDraw", AdrenalineDraw, 0xA0, 0x10000, 0, 0, NULL);
+	// v6: stack 0x10000 (64 KB) -> 0x20000 (128 KB). The RA login path runs
+	// rcheevos JSON parsing, login callbacks and credential saving on this
+	// stack (v5-login-crash-debug.md NOTE #5); the heavy hash chain moved to
+	// the net worker in v6, but the render path keeps this headroom as cheap
+	// hardening and as a stack-overflow discriminator.
+	SceUID draw_thid = sceKernelCreateThread("AdrenalineDraw", AdrenalineDraw, 0xA0, 0x20000, 0, 0, NULL);
 	if (draw_thid >= 0) {
 		sceKernelStartThread(draw_thid, 0, NULL);
 	}
+
+	// RetroAchievements subsystem (rc_client instance, badge/cache dirs,
+	// PSP RAM mapping for the memory read callback). Still does zero network
+	// work itself.
+	ra_init();
+
+	/* v33: publish the hardcore flag to the PSP via the shared SceAdrenaline
+	 * struct. MUST run here in InitAdrenaline, before TAI_CONTINUE at :674
+	 * resumes pspemu boot / plugin load. Same ScePspemuConvertAddress(
+	 * ADRENALINE_ADDRESS, KERMIT_OUTPUT_MODE, ADRENALINE_SIZE) +
+	 * ScePspemuWritebackCache idiom as the REBOOTEX_CONFIG write (:632-654).
+	 * The PSP reads it at systemctrl/main.c:319 (sceUtility_Driver) and at
+	 * loadPlugins() (fail-closed re-read). */
+	{
+		SceAdrenaline *adrenaline = (SceAdrenaline *)ScePspemuConvertAddress(ADRENALINE_ADDRESS, KERMIT_OUTPUT_MODE, ADRENALINE_SIZE);
+		adrenaline->hardcore_mode = ra_hardcore_opt_in_get();
+		ScePspemuWritebackCache(adrenaline, ADRENALINE_SIZE);
+	}
+
+	// v24: bring the network up at BOOT, asynchronously, on the dedicated
+	// RA_BootNet worker -- so the saved-token login (and therefore rcheevos
+	// achievement tracking) is armed from game boot instead of from the
+	// player's first Adrenaline-menu-open.
+	//
+	// This replaces the old "net bootstrap is lazy: it happens on first login
+	// attempt, not here" design. That deferral was not free: rcheevos refuses
+	// to fire a trigger that is already true when tracking first arms, so any
+	// one-time story flag the player reached before opening the menu was
+	// swallowed permanently and silently (investigation-result/
+	// autologin-tracking-fix-scope.md, CRITICAL-2).
+	//
+	// Boot safety: nothing here runs on this thread. ra_start_boot_net()
+	// creates a low-priority worker and returns, so InitAdrenaline() is not
+	// slowed and AdrenalineDraw's first frames are never blocked. The v4
+	// black screen this codebase warns about was root-caused to a 64 MiB
+	// ScePaf heap reservation at module_start(), not to the NET load (see
+	// v4-black-screen-opus.md); ScePaf was removed from the RA path entirely
+	// in v9 and is not reintroduced here. This is still InitAdrenaline(), not
+	// module_start().
+	ra_start_boot_net();
 
 	return 0;
 }
@@ -672,6 +770,14 @@ int sceAVConfigSetMasterVol(int vol);
 void _start() __attribute__ ((weak, alias("module_start")));
 int module_start(SceSize args, void *argp) {
 	int res;
+
+	/* NO RetroAchievements network work here. v4 called
+	 * ra_net_preload_modules() as the first statement of module_start() and
+	 * its stage-0 ScePaf load black-screened the console after the Adrenaline
+	 * logo (see investigation-result/v4-black-screen-opus.md and
+	 * v4-black-screen-debug.md). The NET/SSL/HTTP/HTTPS ladder now runs only
+	 * on the deferred path: ra_net_ensure_started() calls the preload
+	 * idempotently when the trophy menu first needs the network. */
 
 	res = sceSysmoduleLoadModule(SCE_SYSMODULE_LIVEAREA);
 
@@ -1265,7 +1371,7 @@ int module_start(SceSize args, void *argp) {
 }
 
 int module_stop(SceSize args, void *argp) {
-	for (int i = n_uids - 1; i >= 0; i++) {
+	for (int i = n_uids - 1; i >= 0; i--) {
 		taiInjectRelease(uids[i]);
 	}
 

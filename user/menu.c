@@ -43,6 +43,7 @@
 #include "usb.h"
 #include "utils.h"
 #include "math_utils.h"
+#include "ra/ra.h"
 #include "../adrenaline_version.h"
 
 #include "includes/lcd3x_v.h"
@@ -83,6 +84,17 @@ static int EnterStandbyMode();
 static int OpenOfficialSettings();
 static int ExitPspEmuApplication();
 static int ResetAdrenalineSettings();
+static int ToggleRaHardcore();
+
+/* v32: backing buffer for the About-tab RA mode row. about_entries[] is a
+ * static table, so the row's name points here and drawMenu() refreshes the
+ * text from ra_is_hardcore() whenever the About tab is drawn. */
+static char ra_mode_line[64] = "";
+
+/* v32: status text for the Settings-tab hardcore toggle, drawn on the same
+ * bottom info line the CFW/filter notes use (FONT_Y_LINE(17)) while the
+ * entry is selected. Set by ToggleRaHardcore(); empty until first press. */
+static char ra_hardcore_status[96] = "";
 
 // RGB colors for the filter box used by f.lux
 static float flux_colors[] = {
@@ -120,6 +132,12 @@ static MenuEntry settings_entries[] = {
 	{ "System Storage Location",   MENU_ENTRY_TYPE_OPTION, 0, NULL, &config.ef_location, ef_location_options, sizeof(ef_location_options) / sizeof(char **) },
 	{ "USB device",                MENU_ENTRY_TYPE_OPTION, 0, NULL, &config.usbdevice, usbdevice_options, sizeof(usbdevice_options) / sizeof(char **) },
 	{ "Skip Adrenaline Boot Logo", MENU_ENTRY_TYPE_OPTION, 0, NULL, &config.skip_logo, no_yes_options, sizeof(no_yes_options) / sizeof(char **) },
+	/* v32: RetroAchievements hardcore opt-in. CALLBACK (not OPTION): it only
+	 * creates/deletes the ux0:data/PSPEMUCFW/ra_hardcore marker file and sets
+	 * the status line — it NEVER touches the running rc_client, because a
+	 * mid-session casual->hardcore flip would raise RC_CLIENT_EVENT_RESET and
+	 * stall all tracking. Takes effect at the next Adrenaline launch. */
+	{ "RetroAchievements Hardcore", MENU_ENTRY_TYPE_CALLBACK, 0, ToggleRaHardcore, NULL, NULL, 0 },
 	{ "Reset Adrenaline Settings", MENU_ENTRY_TYPE_CALLBACK, 0, ResetAdrenalineSettings, NULL, NULL, 0 },
 };
 
@@ -130,7 +148,9 @@ static MenuEntry about_entries[] = {
 	{ "6.61 Adrenaline-" ADRENALINE_VERSION_MAJOR_STR "." ADRENALINE_VERSION_MINOR_STR "." ADRENALINE_VERSION_MICRO_STR, MENU_ENTRY_TYPE_TEXT, ORANGE, NULL, NULL, NULL, 0 },
 	#endif
 	{ "by Cat and GrayJack", MENU_ENTRY_TYPE_TEXT, WHITE, NULL, NULL, NULL, 0 },
-	{ "", MENU_ENTRY_TYPE_TEXT, WHITE, NULL, NULL, NULL, 0 },
+	/* v32: RA mode row — text refreshed from ra_is_hardcore() when the About
+	 * tab is drawn (see drawMenu); static table, so it points at a buffer. */
+	{ ra_mode_line, MENU_ENTRY_TYPE_TEXT, WHITE, NULL, NULL, NULL, 0 },
 	{ "", MENU_ENTRY_TYPE_TEXT, WHITE, NULL, NULL, NULL, 0 },
 	{ "Credits", MENU_ENTRY_TYPE_TEXT, ORANGE, NULL, NULL, NULL, 0 },
 	{ "Team molecule for HENkaku", MENU_ENTRY_TYPE_TEXT, WHITE, NULL, NULL, NULL, 0 },
@@ -149,10 +169,13 @@ static TabEntry tab_entries[] = {
 	{ "States", NULL, 0, 0 },
 	{ "Settings", settings_entries, sizeof(settings_entries) / sizeof(MenuEntry), 1 },
 	{ "About", about_entries, sizeof(about_entries) / sizeof(MenuEntry), 0 },
+	{ "Trophies", NULL, 0, 0 },
 };
 
 #define N_TABS (sizeof(tab_entries) / sizeof(TabEntry))
 #define TAB_SIZE (WINDOW_WIDTH / N_TABS)
+
+#define TAB_TROPHIES 4
 
 static AdrenalineConfig old_config;
 static int tab_sel = 0;
@@ -165,6 +188,12 @@ static int open_official_settings = 0;
 
 static SceUID settings_semaid = -1;
 
+/* Set when the menu was opened by the AdrenalineDraw loop in response to the
+ * XMB "Trophies" item, rather than by ScePspemuCustomSettingsHandler. Read by
+ * ExitAdrenalineMenu() to decide whether the settings semaphore has a waiter
+ * to signal -- see the comment there. */
+static int ra_opened_via_xmb = 0;
+
 static int EnterStandbyMode() {
 	stopUsb(usbdevice_modid);
 	ExitAdrenalineMenu();
@@ -172,7 +201,7 @@ static int EnterStandbyMode() {
 	return 0;
 }
 
-static void SaveAdrSetting() {
+static int SaveAdrSetting() {
 	config.magic[0] = ADRENALINE_CFG_MAGIC_1;
 	config.magic[1] = ADRENALINE_CFG_MAGIC_2;
 	WriteFile("ux0:data/" ADRENALINE_TITLEID "/adrenaline.bin", &config, sizeof(AdrenalineConfig));
@@ -224,6 +253,17 @@ static int EnterAdrenalineMenu() {
 		settings_entries[0].n_options = sizeof(cfwtype_options)/sizeof(char*);
 	}
 
+	// RetroAchievements: when the menu was opened through the Trophies entry
+	// point (XMB icon / PS-button tab), jump straight to the Trophies tab
+	if (ra_trophy_open_requested) {
+		ra_trophy_open_requested = 0;
+		tab_sel = TAB_TROPHIES;
+	}
+
+	if (tab_sel == TAB_TROPHIES) {
+		ra_view_opened();
+	}
+
 	return 0;
 }
 
@@ -231,6 +271,15 @@ int ExitAdrenalineMenu() {
 	if (changed) {
 		SaveAdrSetting();
 	}
+
+	// RetroAchievements: leave the trophy view (aborts any in-flight login IME)
+	ra_view_closed();
+
+	// v15: and tell the RA session the identified game may no longer be the
+	// running one -- the next trophy-screen open re-hashes and swaps/drops the
+	// loaded game as needed (v14-scroll-stale-debug.md, Bug 2). Cheap flag
+	// only: no network and no rc_client call on this path.
+	ra_note_menu_closed();
 
 	SceAdrenaline *adrenaline = (SceAdrenaline *)ScePspemuConvertAddress(ADRENALINE_ADDRESS, KERMIT_INPUT_MODE, ADRENALINE_SIZE);
 	if (adrenaline->pops_mode) {
@@ -253,7 +302,22 @@ int ExitAdrenalineMenu() {
 	SetPspemuFrameBuffer((void *)SCE_PSPEMU_FRAMEBUFFER);
 	sceDisplayWaitVblankStart();
 
-	sceKernelSignalSema(settings_semaid, 1);
+	/* Fix 2 companion guard.
+	 *
+	 * This signal used to be unconditional, which was correct while the ONLY
+	 * way into the menu was ScePspemuCustomSettingsHandler (a2 == 3), whose
+	 * a2 == 1 branch performs the paired sceKernelWaitSema. The menu can now
+	 * also be opened from the AdrenalineDraw loop for the XMB Trophies item,
+	 * and that path has no waiter. Signalling with no waiter would leave the
+	 * count at 1 (the sema is created initCount 0 / maxCount 1), so the NEXT
+	 * genuine PS-button close would return from its wait immediately and skip
+	 * ScePspemuSetDisplayConfig(). Only signal for opens that really came
+	 * through the shell handler.
+	 */
+	if (ra_opened_via_xmb)
+		ra_opened_via_xmb = 0;
+	else
+		sceKernelSignalSema(settings_semaid, 1);
 
 	finishStates();
 
@@ -274,6 +338,32 @@ int ResetAdrenalineSettings() {
 	if (sceIoGetstat("ux0:app/" ADRENALINE_TITLEID "/adrenaline.bin", &stat) >= 0) {
 		WriteFile("ux0:app/" ADRENALINE_TITLEID "/adrenaline.bin", &config, sizeof(AdrenalineConfig));
 	}
+
+	return 0;
+}
+
+/* v32: Settings-tab "RetroAchievements Hardcore" toggle. Flips the marker
+ * file ONLY — never the live rc_client — so the running session keeps its
+ * current mode and there is no mid-session casual->hardcore flip (which would
+ * raise RC_CLIENT_EVENT_RESET and stall tracking). The change takes effect at
+ * the next Adrenaline launch, when ra_init() reads the marker. The status text
+ * says so explicitly. Label matches every other surface: "Hardcore (pending
+ * RA validation)" — our UA is unique but not yet on RA's server-side
+ * allowlist, so hardcore unlocks are expected to be demoted to softcore until
+ * RAdmin validates the client. */
+static int ToggleRaHardcore() {
+	int now_on = ra_hardcore_opt_in_get() ? 0 : 1;   /* toggle the file state */
+
+	if (ra_hardcore_opt_in_set(now_on) < 0 && now_on) {
+		/* write failed (e.g. no ux0:data/PSPEMUCFW yet); report honestly */
+		snprintf(ra_hardcore_status, sizeof(ra_hardcore_status),
+			"Hardcore: could not save (write failed)");
+		return 0;
+	}
+
+	snprintf(ra_hardcore_status, sizeof(ra_hardcore_status),
+		"Hardcore (pending RA validation): %s at next launch",
+		now_on ? "ON" : "OFF");
 
 	return 0;
 }
@@ -323,6 +413,15 @@ void drawMenu() {
 		pgf_draw_text(x, FONT_Y_LINE(19), WHITE, FONT_SIZE, tab_entries[i].name);
 	}
 
+	// v32: refresh the About-tab RA mode row from the LIVE mode just before it
+	// is drawn. about_entries[] is static, so its row name points at
+	// ra_mode_line; rewriting the buffer here is what makes it show the
+	// current session's mode. Same honest label as everywhere else.
+	if (tab_sel == 3) {
+		snprintf(ra_mode_line, sizeof(ra_mode_line), "RA mode: %s",
+			ra_is_hardcore() ? "Hardcore (pending RA validation)" : "Casual");
+	}
+
 	// Draw entries
 	MenuEntry *menu_entries = tab_entries[tab_sel].entries;
 	if (menu_entries) {
@@ -369,19 +468,46 @@ void drawMenu() {
 			char *title = "All graphics related options are not taking effect with the Original rendering mode.";
 			pgf_draw_textf(WINDOW_X + ALIGN_CENTER(WINDOW_WIDTH, vita2d_pgf_text_width(font, FONT_SIZE, title)), FONT_Y_LINE(17), WHITE, FONT_SIZE, title);
 		}
+		// v32: status line for the RetroAchievements Hardcore toggle. Keyed off
+		// the callback pointer (not a hardcoded index) so inserting/reordering
+		// settings entries cannot silently detach it. Shown on the same bottom
+		// info line as the CFW/filter notes, only while that entry is selected
+		// and a status has been set (empty until the first press).
+		if (tab_sel == 2 && menu_entries[menu_sel].callback == ToggleRaHardcore
+				&& ra_hardcore_status[0]) {
+			pgf_draw_textf(WINDOW_X + ALIGN_CENTER(WINDOW_WIDTH, vita2d_pgf_text_width(font, FONT_SIZE, ra_hardcore_status)), FONT_Y_LINE(17), WHITE, FONT_SIZE, ra_hardcore_status);
+		}
+	} else if (tab_sel == TAB_TROPHIES) {
+		// RetroAchievements trophy screen (also hosts the inline login prompt)
+		ra_draw_trophy_tab();
 	} else {
 		drawStates();
 	}
 }
 
 void ctrlMenu() {
+	// RetroAchievements: swallow menu input while the login IME dialog is up;
+	// the dialog owns the pad (cross = confirm) and menu actions must not fire.
+	if (ra_is_ime_active()) {
+		return;
+	}
+
 	if (released_pad[PAD_PSBUTTON]) {
 		ExitAdrenalineMenu();
 	}
 
 	if (!open_options) {
 		if (released_pad[PAD_CANCEL]) {
-			ExitAdrenalineMenu();
+			// v21: the trophy collection browser gets first refusal on O.
+			// It consumes the press ONLY on the remote game-detail screen,
+			// where O means "back to the collection". In every other state --
+			// the collection itself, the booted-game grid, and every non-trophy
+			// tab (ra_view_is_open() is false there, because the tab tracker
+			// below calls ra_view_closed() on L/R switches too) -- it returns 0
+			// and O keeps its existing meaning of closing the menu.
+			if (!ra_view_handle_cancel()) {
+				ExitAdrenalineMenu();
+			}
 		}
 
 		if (pressed_pad[PAD_LTRIGGER]) {
@@ -413,6 +539,23 @@ void ctrlMenu() {
 			}
 		}
 
+		// RetroAchievements: track trophy tab visibility (login dialog abort,
+		// row refresh start/stop)
+		{
+			static int ra_tab_was_open = 0;
+			if (tab_sel == TAB_TROPHIES) {
+				if (!ra_tab_was_open) {
+					ra_view_opened();
+					ra_tab_was_open = 1;
+				}
+			} else {
+				if (ra_tab_was_open) {
+					ra_view_closed();
+					ra_tab_was_open = 0;
+				}
+			}
+		}
+
 		// SQUARE on Settings tab when on graphical options (filter, screen scale).
 		if (pressed_pad[PAD_SQUARE] && tab_sel == 2 && menu_sel >= 1 && menu_sel <= 7) {
 			g_hide_menu = 1;
@@ -425,6 +568,9 @@ void ctrlMenu() {
 	// Savestates
 	if (tab_sel == 1) {
 		ctrlStates();
+	} else if (tab_sel == TAB_TROPHIES) {
+		// RetroAchievements trophy screen input (also drives the login prompt)
+		ra_ctrl_trophy_tab();
 	} else {
 		if (tab_entries[tab_sel].moveable) {
 			MenuEntry *menu_entries = tab_entries[tab_sel].entries;
@@ -608,6 +754,26 @@ int AdrenalineDraw(SceSize args, void *argp) {
 			lastPops = 1;
 		}
 
+		// RetroAchievements: consume the XMB "Trophies" request (plan S1-7).
+		// The Kermit request thread only sets the flag (main.c:453) -- it must
+		// not open the menu itself, because the PSP side is blocked on
+		// sceKermitSendRequest until that thread responds. This is the render
+		// thread, so opening here is safe.
+		//
+		// The menu_open guard is required: without it a request arriving while
+		// the menu is already up would stay pending and re-open the menu the
+		// instant the user closed it.
+		if (ra_trophy_open_requested) {
+			if (menu_open) {
+				ra_trophy_open_requested = 0;
+				tab_sel = TAB_TROPHIES;
+				ra_view_opened();
+			} else {
+				ra_opened_via_xmb = 1;
+				EnterAdrenalineMenu(); // clears the flag and selects TAB_TROPHIES
+			}
+		}
+
 		// Draw savestate screen
 		if (adrenaline->savestate_mode != SAVESTATE_MODE_NONE) {
 			vita2d_start_drawing();
@@ -663,11 +829,50 @@ int AdrenalineDraw(SceSize args, void *argp) {
 			}
 		}
 
-		// Do not draw if dialog is running
-		if (sceCommonDialogIsRunning() || (config.graphics_filtering == 0 && menu_open == 0 && draw_native == 0)) {
+		// Do not draw if dialog is running.
+		// Exception: while the RetroAchievements login IME dialog is active we
+		// keep rendering our trophy screen and composite the dialog on top of
+		// it via vita2d_common_dialog_update() below.
+		//
+		// v27: do not "continue" out of the loop here -- fall through the draw
+		// path to the ra_tick label at the bottom instead. ra_tick() is pure CPU
+		// upkeep (net-completion FIFO drain, rc_client idle/do_frame, IME poll)
+		// with zero draw dependency; the mode-0 branch used to skip it entirely
+		// during gameplay, starving the RA driver thread in the default
+		// configuration ("Original" filter is graphics_filtering == 0, the
+		// memset-0 default) and silently re-creating the pre-v24
+		// nothing-tracked-until-first-menu-open condition. See the kernel
+		// re-review, investigation-result/kernel-rereview-dsqwen/
+		// qwen-kernel-memory-rereview.md, finding 2.
+		//
+		// Draw protection is preserved: this branch still bypasses all of the
+		// vita2d/GXM work below (no vita2d_start_drawing, no shader/texture
+		// path, no swap) and still waits on vblank for frame pacing. Exactly
+		// one ra_tick() per loop iteration in every mode/menu state: the label
+		// has exactly two entry edges -- this goto and the normal flow that
+		// drops into it from above -- and they are mutually exclusive within
+		// an iteration (this is the loop's only continue/goto), so the tail
+		// can never be double-driven.
+		// RetroAchievements: badge GPU work (create/destroy textures) happens
+		// here, outside any GXM scene, fenced with sceGxmFinish when needed.
+		//
+		// v30: HOISTED above the mode-0 skip below. This is the CONSUMER of a
+		// queue whose producer (ra_net_tick -> ra_badge_deliver ->
+		// ra_badge_queue_upload, plus the ra_view_tick prefetch pump) keeps
+		// running across that skip via the ra_tick tail. Leaving the consumer
+		// inside the jumped-over region starved it: during Original-filter
+		// closed-menu play the 8-slot pending queue filled and every later
+		// delivery was decoded and then thrown away. Same starvation class
+		// v27 and v29 fixed on ra_tick and on the toast, on a third resource.
+		// Still above vita2d_start_drawing() on every path, so the function's
+		// documented "outside any GXM scene" precondition is preserved
+		// verbatim; it self-gates to an 8-iteration .bss scan when idle.
+		ra_badges_upload_pending();
+
+		if ((sceCommonDialogIsRunning() && !ra_is_ime_active()) || (config.graphics_filtering == 0 && menu_open == 0 && draw_native == 0 && !ra_toast_is_active())) {
 			sceDisplayWaitVblankStart();
 
-			continue;
+			goto ra_tick;
 		}
 
 		// Draw display
@@ -737,6 +942,16 @@ int AdrenalineDraw(SceSize args, void *argp) {
 			}
 		}
 
+		// RetroAchievements: achievement-unlock toast over the game. Re-select the
+		// overlay shader (the same program the menu + trophy-view badges draw with)
+		// so the toast's badge texture renders through a proven shader, then draw.
+		// Occluded by the menu when it opens (menu background is opaque), so this
+		// satisfies "over the game, not the menu" with no extra conditionals.
+		vita2d_texture_set_program(overlay_shader->vertexProgram, overlay_shader->fragmentProgram);
+		vita2d_texture_set_wvp(overlay_shader->wvpParam);
+		vita2d_texture_set_vertexInput(&overlay_shader->vertexInput);
+		vita2d_texture_set_fragmentInput(&overlay_shader->fragmentInput);
+		ra_toast_draw();
 
 		// Draw Menu
 		if (menu_open && !g_hide_menu) {
@@ -798,7 +1013,16 @@ int AdrenalineDraw(SceSize args, void *argp) {
 
 		// End drawing
 		vita2d_end_drawing();
-		vita2d_swap_buffers();
+
+		// RetroAchievements: while the login IME (a common dialog) is active we
+		// composite it over our trophy screen. The dialog takes over display
+		// presentation, so we hand it our back buffer instead of swapping it.
+		if (ra_is_ime_active() && sceCommonDialogIsRunning()) {
+			vita2d_wait_rendering_done();
+			vita2d_common_dialog_update();
+		} else {
+			vita2d_swap_buffers();
+		}
 
 	// Update FPS frames
 	// frames++;
@@ -814,6 +1038,12 @@ int AdrenalineDraw(SceSize args, void *argp) {
 		if (menu_open) {
 			ctrlMenu();
 		}
+
+		// RetroAchievements per-frame upkeep: drains the net-completion FIFO
+		// (rc_client server callbacks run here, on the render thread), polls
+		// the login IME dialog, and drives rc_client idle/do_frame.
+ra_tick:
+		ra_tick();
 	}
 
 	return sceKernelExitDeleteThread(0);
@@ -821,6 +1051,9 @@ int AdrenalineDraw(SceSize args, void *argp) {
 
 int ScePspemuCustomSettingsHandler(int a1, int a2, int a3, int a4) {
 	if (a2 == 3) {
+		// This open DOES have a paired sceKernelWaitSema below (a2 == 1), so
+		// the close must signal. Last opener wins if the menu was already up.
+		ra_opened_via_xmb = 0;
 		EnterAdrenalineMenu();
 	} else if (a2 == 1) {
 		sceKernelWaitSema(settings_semaid, 1, NULL);

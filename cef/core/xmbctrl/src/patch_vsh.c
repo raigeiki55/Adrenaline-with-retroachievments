@@ -40,6 +40,12 @@ static int g_unload = 0;
 static int g_context_mode = 0;
 static u32 g_backup[4];
 
+/* Adrenaline+ RetroAchievements: non-delegating XMB trigger variant, for
+ * A/B testing only. Default 0 = delegate + side effect (safe, tested path). */
+#ifndef RA_TROPHY_NONDELEGATING
+#define RA_TROPHY_NONDELEGATING 0
+#endif
+
 static SceVshItem *g_plugin_mgr_item = NULL;
 static SceVshItem *g_cfw_conf_item = NULL;
 static SceVshItem *g_ef_item[5] = {NULL};
@@ -106,6 +112,24 @@ static void (*OnRetry)() = NULL;
 
 static void (*AddSysconfItem)(u32 *option, SceSysconfItem **item) = NULL;
 static void (*OnInitMenuPspConfig)() = NULL;
+
+/* Adrenaline+ RetroAchievements Trophies: NO custom XMB item.
+ *
+ * v20 inserted a "* Trophies" SceVshItem into the XMB Extras column (and a
+ * cross-column fallback anchored on msgtop_game_savedata). v22 removes both:
+ * the item only opened the Vita-side overlay, which the PS-button menu's
+ * Trophies tab already reaches directly, so the XMB item added a second door
+ * to the same room at the cost of patching Sony's item table.
+ *
+ * What deliberately REMAINS (bridge plumbing, now reachable only if some other
+ * caller dispatches it -- harmless dead code, kept so the path is not lost):
+ *   - xmbctrl.h: sysconf_trophies_action_arg (0x1024), CUSTOM_ID_RA_TROPHIES
+ *   - ExecuteActionPatched()'s sysconf_trophies_action_arg branch, which sends
+ *     ADRENALINE_VITA_CMD_OPEN_TROPHIES over Kermit.
+ * Nothing in this module now creates an item carrying that action_arg, so the
+ * XMB is back to stock + Epinephrine CFW Settings + Plugins Manager.
+ */
+
 
 static void *addCustomVshItem(int id, char *text, int action_arg, SceVshItem *orig) {
 	SceVshItem *item = (SceVshItem *)paf_malloc(sizeof(SceVshItem));
@@ -380,6 +404,24 @@ int ExecuteActionPatched(int action, int action_arg) {
 			g_is_cfw_config = 2;
 			action = sysconf_console_action;
 			action_arg = sysconf_console_action_arg;
+		} else if (action_arg == sysconf_trophies_action_arg) {
+			// Adrenaline+ RetroAchievements Trophies.
+			// Side effect: send one scalar across the Kermit bridge. The Vita
+			// handler only sets a flag and responds immediately, so this
+			// blocks the XMB UI thread for microseconds. Fire-and-forget.
+			sctrlSendAdrenalineCmd(ADRENALINE_VITA_CMD_OPEN_TROPHIES, 0);
+		#if RA_TROPHY_NONDELEGATING
+			// Variant (b): do NOT open System Settings underneath.
+			// Unverified; off by default, kept for A/B testing on hardware.
+			return 0;
+		#else
+			// Variant (a) [default]: delegate to Sony's real System Settings
+			// exactly like CFW Settings does, but WITHOUT hijacking sysconf
+			// (no g_is_cfw_config=1). The Vita-side trophy overlay covers it.
+			g_is_cfw_config = 0;
+			action = sysconf_console_action;
+			action_arg = sysconf_console_action_arg;
+		#endif
 		} else {
 			g_is_cfw_config = 0;
 		}

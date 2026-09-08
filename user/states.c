@@ -39,6 +39,7 @@
 
 #include "main.h"
 #include "menu.h"
+#include "ra/ra.h"
 #include "states.h"
 #include "usb.h"
 #include "utils.h"
@@ -62,8 +63,22 @@ static char *option_entries_exist[] = {
 	"Cancel",
 };
 
+/* v32: RetroAchievements hardcore — loading a state is forbidden (G1). Same
+ * slots/order as option_entries_exist so option_sel logic is unchanged; only
+ * entry 0 differs: it is labelled as blocked and acts as a no-op close, so
+ * the PSP world is never even suspended for a load. Overwrite/Delete stay
+ * permitted (B11 asymmetry — states remain creatable in hardcore). The
+ * enforcing backstop is in main.c's ADRENALINE_VITA_CMD_LOADSTATE branch. */
+static char *option_entries_exist_hc[] = {
+	"Load State (blocked: Hardcore)",
+	"Overwrite State",
+	"Delete State",
+	"Cancel",
+};
+
 #define N_OPTION_ENTRIES_NEW (sizeof(option_entries_new) / sizeof(char **))
 #define N_OPTION_ENTRIES_EXIST (sizeof(option_entries_exist) / sizeof(char **))
+#define N_OPTION_ENTRIES_EXIST_HC (sizeof(option_entries_exist_hc) / sizeof(char **))
 
 #define OPTION_MODE_NEW 0
 #define OPTION_MODE_EXIST 1
@@ -372,6 +387,15 @@ void ctrlStates() {
 				switch (option_sel) {
 					case 0:
 					{
+						/* v32: in hardcore, "Load State (blocked: Hardcore)" is
+						 * a no-op close — no ExitAdrenalineMenu, no loadState,
+						 * so ADRENALINE_PSP_CMD_LOADSTATE is never sent and the
+						 * PSP world never suspends for a load that main.c would
+						 * refuse anyway (the enforcing backstop). */
+						if (ra_is_hardcore()) {
+							open_options = 0;
+							break;
+						}
 						ExitAdrenalineMenu();
 						loadState(base_pos+rel_pos);
 						break;
@@ -438,6 +462,13 @@ void ctrlStates() {
 				option_entries = option_entries_new;
 				n_options = N_OPTION_ENTRIES_NEW;
 				option_mode = OPTION_MODE_NEW;
+			} else if (ra_is_hardcore()) {
+				/* v32: hardcore swaps in the blocked-load variant of the same
+				 * table (same slot count/order, so option_sel handling and the
+				 * OPTION_MODE_EXIST switch are unchanged) */
+				option_entries = option_entries_exist_hc;
+				n_options = N_OPTION_ENTRIES_EXIST_HC;
+				option_mode = OPTION_MODE_EXIST;
 			} else {
 				option_entries = option_entries_exist;
 				n_options = N_OPTION_ENTRIES_EXIST;

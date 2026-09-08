@@ -1,0 +1,1 @@
+add_stub_lib(pspsystemctrl_kernel SystemCtrlForKernel.S SystemCtrlForKernel)
