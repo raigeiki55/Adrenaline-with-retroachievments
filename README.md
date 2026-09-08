@@ -51,6 +51,10 @@ full three-stage build (PSP/MIPS cef, kernel, user). The output is `Adrenaline.v
 Install the `.vpk` over your existing Adrenaline bubble (or fresh). Login via the Trophy tab,
 or place a `ra_login.txt` credentials file at `ux0:data/PSPEMUCFW/`.
 
+On a fresh install, press **X** on the first boot prompt to auto-download the PSP 6.61 firmware
+(the bubble fetches it from Sony). If you prefer to supply it manually (e.g. for an offline
+install), place the firmware PBP at `ux0:data/PSPEMUCFW/661.PBP`.
+
 ## License
 
 This fork inherits **GPL-3.0-or-later** (see [`LICENSE`](LICENSE)). The vendored RetroAchievements
