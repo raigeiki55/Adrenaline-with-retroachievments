@@ -87,4 +87,7 @@ runtime (rcheevos, MIT) and other components are listed in
 
 - [isage/Adrenaline](https://github.com/isage/Adrenaline) — the base fork this builds on
 - [TheOfficialFloW/Adrenaline](https://github.com/TheOfficialFloW/Adrenaline) — original Adrenaline
+- **[PPSSPP](https://github.com/hrydgard/ppsspp)** — its RetroAchievements client was a key
+  reference for ours, alongside [RetroArch](https://github.com/libretro/RetroArch) and
+  [DuckStation](https://github.com/stenzek/duckstation)
 - [RetroAchievements](https://retroachievements.org) + [rcheevos](https://github.com/RetroAchievements/rcheevos)
