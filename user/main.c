@@ -50,6 +50,7 @@
 #include "msfs.h"
 #include "menu.h"
 #include "ra/ra.h"
+#include "ra/ra_internal.h"   /* v38 charting: RA_LOG for the thread-priority chart in sceKernelCreateThreadPatched */
 #include "states.h"
 #include "usb.h"
 #include "utils.h"
@@ -701,6 +702,96 @@ static SceUID sceKernelCreateThreadPatched(const char *name, SceKernelThreadEntr
 		entry = (SceKernelThreadEntry)ScePspemuRemoteMsfs;
 	}
 
+	/* v38 charting: log each unique ScePspemu thread's name, initPriority and
+	 * cpuAffinityMask once, before the real create. The v35 P1 revert put
+	 * RA_NetWorker back at 0x80; whether any ScePspemu thread sits in the
+	 * 0x80-0xB0 band decides which priority is structurally safe, and the
+	 * band was never enumerated -- this line charts it for the capture.
+	 * Priority table (Vita: lower number = HIGHER priority): at 0x80 (128)
+	 * the worker outranks every band thread (128 < P < 176); at 0xB0 (176)
+	 * a band thread outranks the worker and can starve it.
+	 *
+	 * Safety:
+	 *  - OOB closure: the scan bound is clamped to the table size. The
+	 *    counter can transiently exceed the cap (racers that all passed the
+	 *    pre-check), so the clamp is the ONLY thing that bounds the reads.
+	 *  - Overflow marker: when the cap is hit -- the counter is already at
+	 *    cap, or a claim races past it -- a one-time marker line is logged
+	 *    via CAS. A truncated chart must be VISIBLY truncated: absence of a
+	 *    band thread is evidence of absence when the overflow marker is
+	 *    absent and no two names share a 31-character prefix.
+	 *    (SceKernelThreadInfo.name is char[32], nul-terminated --
+	 *    psp2common/kernel/threadmgr.h:88 -- so the kernel itself stores at
+	 *    most 31 characters, and two names differing only past character 31
+	 *    would be indistinguishable system-wide. The hook does see the
+	 *    caller's raw pointer before the kernel truncates, so it is not
+	 *    provably impossible -- hence the clause rather than a waiver.)
+	 *  - Publication (the ra_fifo_produce_commit/consume_begin idiom,
+	 *    ra_net.c:627-647): name bytes are written, then a release barrier,
+	 *    then the valid flag; the scan checks the flag, takes the acquire
+	 *    barrier, then reads the name. With both halves a partial name can
+	 *    never be observed, so a false match is impossible. Residual bound,
+	 *    honestly: a duplicate line when two threads race to chart the same
+	 *    new name, or a line missing when a >31-char name truncates to an
+	 *    already-stored prefix -- never corruption and never a wrong value
+	 *    (the logged values come from the caller's own parameters).
+	 *  - Stack: table and flags are static storage; the only cost on the
+	 *    foreign caller is RA_LOG's own frame (debugPrintf's char[512]).
+	 *
+	 * Coverage caveat (route 3): threads created before the hook is installed
+	 * (module_start, via taiHookFunctionImport) never reach it. The boundary
+	 * ships IN LOG with every capture -- one unconditional line emitted once
+	 * at the install site in module_start -- so zero chart lines after it is
+	 * unambiguous: armed and covered nothing, not "never armed". A null must
+	 * be read as "no band-resident thread among threads created after hook
+	 * installation" -- threads from ScePspemu's own module start are not
+	 * covered by this chart. */
+	{
+		enum { RA_CHART_N = 64 };
+		static char ra_charted[RA_CHART_N][32];
+		static volatile int ra_charted_valid[RA_CHART_N];
+		static int ra_charted_n;
+		static int ra_chart_overflow;
+		int ra_i, ra_n, ra_seen = 0;
+
+		ra_n = ra_charted_n;
+		if (ra_n > RA_CHART_N)
+			ra_n = RA_CHART_N; /* clamp: the only OOB closure */
+
+		for (ra_i = 0; ra_i < ra_n; ra_i++) {
+			if (!ra_charted_valid[ra_i])
+				continue;
+			__sync_synchronize(); /* acquire: pairs with the release on publish */
+			if (strncmp(ra_charted[ra_i], name, 31) == 0) {
+				ra_seen = 1;
+				break;
+			}
+		}
+
+		if (!ra_seen) {
+			if (ra_charted_n < RA_CHART_N) {
+				int ra_slot = __sync_fetch_and_add(&ra_charted_n, 1);
+				if (ra_slot < RA_CHART_N) {
+					memset(ra_charted[ra_slot], 0, 32);
+					strncpy(ra_charted[ra_slot], name, 31);
+					__sync_synchronize(); /* release: name bytes before valid */
+					ra_charted_valid[ra_slot] = 1;
+					RA_LOG("[RA] pspemu thread: '%s' prio %d (0x%02X) affinity 0x%X\n",
+						name, initPriority, initPriority, cpuAffinityMask);
+				} else {
+					/* claimed past the cap in a race: mark, don't write */
+					if (__sync_bool_compare_and_swap(&ra_chart_overflow, 0, 1))
+						RA_LOG("[RA] pspemu thread chart OVERFLOW: >%d unique names, chart truncated\n",
+							RA_CHART_N);
+				}
+			} else {
+				if (__sync_bool_compare_and_swap(&ra_chart_overflow, 0, 1))
+					RA_LOG("[RA] pspemu thread chart OVERFLOW: >%d unique names, chart truncated\n",
+						RA_CHART_N);
+			}
+		}
+	}
+
 	return TAI_CONTINUE(SceUID, sceKernelCreateThreadRef, name, entry, initPriority, stackSize, attr, cpuAffinityMask, option);
 }
 
@@ -890,6 +981,16 @@ int module_start(SceSize args, void *argp) {
 
 	// SceLibKernel
 	hooks[n_hooks++] = taiHookFunctionImport(&sceKernelCreateThreadRef, "ScePspemu", 0xCAE9ACE6, 0xC5C11EE7, sceKernelCreateThreadPatched);
+
+	/* v39 charting: the thread-priority chart is armed from this point. The
+	 * coverage boundary ships WITH every capture -- one unconditional line at
+	 * this single-threaded install point, so zero chart lines after it is
+	 * unambiguous ("armed, charted nothing", not "never armed"). Plain
+	 * RA_LOG, no CAS: module_start runs once, unlike the overflow marker on
+	 * the concurrent hook. */
+	RA_LOG("[RA] pspemu thread chart: covers threads created after the "
+		"sceKernelCreateThreadPatched hook is installed; threads created "
+		"during ScePspemu's own module start are NOT covered\n");
 	hooks[n_hooks++] = taiHookFunctionImport(&sceIoOpenRef, "ScePspemu", 0xCAE9ACE6, 0x6C60AC61, sceIoOpenPatched);
 	hooks[n_hooks++] = taiHookFunctionImport(&sceIoGetstatRef, "ScePspemu", 0xCAE9ACE6, 0xBCA5B623, sceIoGetstatPatched);
 

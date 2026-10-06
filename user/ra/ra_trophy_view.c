@@ -58,6 +58,11 @@ static int ra_row_sel = 0;
 static int ra_row_base = 0;
 static int ra_view_open = 0;
 static int ra_offline_display = 0;
+/* v39 Fix A/B: set when the grid was just cleared because the running game
+ * changed -- the title line then draws a neutral "Checking game..." instead of
+ * naming the old session. Reset by ra_view_rebuild_list() once current rows
+ * exist again. */
+static int ra_view_switching = 0;
 
 /* ------------------------------------------------------------------------- */
 /* v21 — the three screens (GAME-COLLECTION-PLAN.md §1)                       */
@@ -263,6 +268,7 @@ void ra_view_rebuild_list(void)
 	ra_n_rows = 0;
 	ra_row_sel = 0;
 	ra_row_base = 0;
+	ra_view_switching = 0;   /* v39 Fix B: current rows are about to exist */
 
 	if (!client || !rc_client_is_game_loaded(client))
 		return;
@@ -707,9 +713,38 @@ void ra_view_opened(void)
 
 	if (ra_is_logged_in()) {
 		ra_offline_display = 0;
+		ra_view_switching = 0;
 		if (ra_is_game_loaded()) {
-			/* show what we already have immediately... */
-			ra_view_rebuild_list();
+			/* v39 Fix A: when this session is already suspect
+			 * (ra_needs_game_revalidate) AND the PSP-side identity has
+			 * visibly changed, do NOT paint the old game's rows -- clear
+			 * the grid and let the empty-state branch below draw the
+			 * "Identifying game..." status while the async re-identify
+			 * runs. Same game still running (the common case) keeps the
+			 * v26 instant-cached-rows path. The ra_net_is_started() term
+			 * matches the ra_tick gate that consumes the pending request:
+			 * when the transport is down the revalidation can never
+			 * proceed, so clearing would only replace populated stale rows
+			 * with a blank screen -- keep today's behaviour offline.
+			 *
+			 * Known limit (documented, not fixed here): an unlock event
+			 * arriving during this window calls ra_view_rebuild_list()
+			 * from ra_client.c (:1478 F1c re-award, :1501 unlock refresh),
+			 * which clears ra_view_switching and repopulates from the old
+			 * session -- pre-v39 behaviour, not a regression, but the
+			 * switching window is exactly when the cross-game trigger
+			 * exposure is live. Closing it belongs with that exposure work
+			 * (unlock path), which is out of scope for v39. */
+			if (ra_needs_game_revalidate() && ra_net_is_started() &&
+					ra_psp_game_changed()) {
+				ra_n_rows = 0;
+				ra_row_sel = 0;
+				ra_row_base = 0;
+				ra_view_switching = 1;
+			} else {
+				/* show what we already have immediately... */
+				ra_view_rebuild_list();
+			}
 			/* ...and, if the menu has been closed since that game was
 			 * identified, re-identify what is running NOW in the background
 			 * (v15 Bug 2: the old game's list used to be shown forever). The
@@ -1216,6 +1251,29 @@ static void ra_draw_current_game(void)
 		y += FONT_Y_SPACE;
 	}
 
+	/* v39 Fix B: name the game this grid belongs to, so a stale list can
+	 * never masquerade as a correct one. Mirrors ra_draw_game_detail()'s
+	 * title line; the " - checking..." suffix marks the revalidation window
+	 * (the rows below may still belong to the previous game). When the grid
+	 * was CLEARED for a detected switch (ra_view_switching), do not name the
+	 * old session at all -- a neutral label is the honest presentation. */
+	if (ra_is_logged_in() && ra_is_game_loaded()) {
+		const char *label;
+		char title_line[160];
+
+		if (ra_view_switching) {
+			label = "Checking game...";
+		} else {
+			const rc_client_game_t *game = rc_client_get_game_info(ra_get_client());
+			const char *title = (game && game->title) ? game->title : "(no title)";
+			snprintf(title_line, sizeof(title_line), "%s%s",
+				title, ra_needs_game_revalidate() ? " - checking..." : "");
+			label = title_line;
+		}
+		pgf_draw_text(WINDOW_X + 10.0f, y, WHITE, FONT_SIZE, label);
+		y += FONT_Y_SPACE;
+	}
+
 	/* trophy rows */
 	float rows_top = y;
 	int login_offset = ra_is_logged_in() ? 0 : 1; /* row 0 = login when signed out */
@@ -1479,7 +1537,14 @@ void ra_view_tick(void)
 	ra_view_prefetch_pump();
 
 	/* live list refresh while displayed (unlocks, progress) */
-	if (ra_view_open && ra_is_logged_in() && ra_is_game_loaded() && !ra_offline_display) {
+	/* v39 Fix A: gated on !ra_view_switching -- while the switching flag is
+	 * set we have DETERMINED the loaded session is the wrong game, so
+	 * refreshing rows from it is exactly what must not happen (it would
+	 * repopulate the stale grid Fix A just cleared and defeat it within a
+	 * second). Re-enables itself naturally: the new game's load callback
+	 * rebuilds and clears the flag. */
+	if (ra_view_open && ra_is_logged_in() && ra_is_game_loaded() && !ra_offline_display &&
+			!ra_view_switching) {
 		static uint32_t refresh_counter = 0;
 		if ((refresh_counter++ % 60) == 0) {
 			/*

@@ -7,6 +7,8 @@
 #include <psp2/types.h>
 #include <psp2/kernel/clib.h>
 
+#include <stdint.h>
+
 #include "ra.h"
 #include "ra_chime.h"   /* achievement-unlock chime (init/play/shutdown) */
 #include "rc_api_request.h"
@@ -21,6 +23,7 @@
  * (psp2shell / PSVita-DebugLog); debugPrintf appends to
  * ux0:data/adrenaline_user_log.txt, which is the only sink a user with just
  * a Vita can actually read back.
+ * v41: hot-path sites use RA_LOG_HOT (below), silent unless ux0:data/PSPEMUCFW/ra_verbose_log exists.
  *
  * v6 note: these lines are what pin the C2-12828-1 login-crash to a stage.
  * The v5 log ended at "stage8 worker thread started -- net layer UP" because
@@ -28,12 +31,66 @@
  * investigation-result/v5-login-crash-debug.md WARNING #4.
  */
 extern int debugPrintf(char *text, ...); /* utils.c */
+unsigned int ra_log_write_errors(void);    /* utils.c, v41: failed sceIoWrite count (PERF werr=) */
 
-#define RA_LOG(...)                       \
-	do {                                  \
-		sceClibPrintf(__VA_ARGS__);       \
-		debugPrintf(__VA_ARGS__);         \
+/* v34 F0: monotonic ms since process start, defined in ra_client.c. Same
+ * clock rc_client uses (ra_get_time_millisecs), so log timestamps and
+ * rcheevos' retry scheduling are directly comparable. */
+extern uint32_t ra_log_ms(void);
+
+/* v34 F0: [s.mmm] timestamp prefix on every line, both sinks.
+ *
+ * Prefix and body are ONE format string (adjacent-literal concatenation), so
+ * each sink still gets exactly ONE call per line -- debugPrintf writes to one
+ * persistent fd (v40, utils.c), one sceIoWrite per call, so a two-call form
+ * would double the debugPrintf share of the ~13 ms per-line RA_LOG cost (both
+ * sinks together, v40-log-measurement.md; the sceClibPrintf/sceIoWrite split
+ * is UNMEASURED), and one call also keeps prefix and body atomic
+ * against the other logging threads (worker, chime, boot). Requires the
+ * format argument to be a string literal (true at every call site, verified
+ * v34) and -std=gnu17 for ##__VA_ARGS__ (the standard CFLAGS_FIX). */
+#define RA_LOG(fmt, ...)                                              \
+	do {                                                              \
+		uint32_t ra_log_now_ = ra_log_ms();                           \
+		sceClibPrintf("[%u.%03u] " fmt, ra_log_now_ / 1000u,          \
+			ra_log_now_ % 1000u, ##__VA_ARGS__);                      \
+		debugPrintf("[%u.%03u] " fmt, ra_log_now_ / 1000u,            \
+			ra_log_now_ % 1000u, ##__VA_ARGS__);                      \
 	} while (0)
+
+/* v41: hot-path gate. RA_LOG_HOT is for the 12 sites whose rate is set by the
+ * frame/texture/poll clock (V41-PLAN.md §1.2). It ALWAYS counts the hit (the
+ * PERF heartbeat reports it) and emits the line only when the verbose-log
+ * marker file was present at ra_init. Gate is evaluated BEFORE ra_log_ms()
+ * and before any formatting. RENDER THREAD ONLY: the counter is a plain
+ * increment with a single writer; never use RA_LOG_HOT from the worker,
+ * chime, boot-net or pspemu threads. */
+enum ra_hot_class {
+	RA_HOT_BADGE_FREE = 0, /* ra_badges_upload_pending: badge free tex= */
+	RA_HOT_BADGE_TEX,      /* ra_badges_upload_pending: badge tex= */
+	RA_HOT_BADGE_DECODE,   /* ra_decode_png_rgba: badge decode WxH rc=ok */
+	RA_HOT_BADGE_FETCH,    /* ra_badge_get: badge fetch */
+	RA_HOT_BADGE_DELIVER,  /* ra_badge_deliver: badge deliver + badge prefetched */
+	RA_HOT_BADGE_DROP,     /* ra_net_fetch_badge: DROP badge offline / fifo_full */
+	RA_HOT_SLOW,           /* the three SLOW bracket lines */
+	RA_HOT_POLL,           /* ra_start_game_load: queued, identify-retry poll only */
+	RA_HOT_N
+};
+extern int ra_log_verbose;                  /* ra_client.c; 0 until ra_init */
+extern uint32_t ra_log_hot_hits[RA_HOT_N];  /* ra_client.c; render thread only */
+
+#define RA_LOG_HOT(cls, fmt, ...)                \
+	do {                                         \
+		ra_log_hot_hits[(cls)]++;                \
+		if (ra_log_verbose)                      \
+			RA_LOG(fmt, ##__VA_ARGS__);          \
+	} while (0)
+
+/* v41: PERF counters (ra_client.c). ra_perf_note_upload is called from the
+ * AdrenalineDraw upload bracket (render thread); ra_perf_emit ONLY from the
+ * net worker (ra_net_worker_main). */
+void ra_perf_note_upload(int events, uint32_t dt_ms);
+void ra_perf_emit(void);
 
 /* FIFO --------------------------------------------------------------------- */
 
@@ -63,6 +120,7 @@ typedef struct ra_fifo_entry {
 	void *server_callback_data;                  /* SERVER_CALL */
 	char badge_name[16];    /* badge file id (RA_FIFO_BADGE_DONE) */
 	int locked;             /* badge locked variant (RA_FIFO_BADGE_DONE) */
+	int prefetch;           /* v34 A1: badge job is a prefetch -- deliver writes the file only */
 
 	/* v6: RA_FIFO_HASH_JOB (game identification off the render thread).
 	 * Work entries carry no payload (the worker reads everything itself);
@@ -154,8 +212,15 @@ void ra_server_call(const rc_api_request_t *request, rc_client_server_callback_t
 
 /* Badge fetch: worker performs GET and writes the raw PNG to the badge cache
  * dir, then posts RA_FIFO_BADGE_DONE. Returns 1 when queued, 0 when it could
- * not be (net worker not up / offline / FIFO full). */
-int ra_net_fetch_badge(const char *url, const char *badge_name, int locked);
+ * not be (net worker not up / offline / FIFO full). v34 A1: prefetch marks the
+ * job so ra_badge_deliver persists the bytes and stops -- no decode, no GPU
+ * upload, slot released. */
+int ra_net_fetch_badge(const char *url, const char *badge_name, int locked, int prefetch);
+
+/* Render-thread consumer of RA_FIFO_BADGE_DONE. Declared here (not a local
+ * extern in ra_net.c) so the adjacent int params locked/prefetch cannot
+ * silently transpose between ra_net.c and ra_badges.c -- v34 A1. */
+void ra_badge_deliver(const char *badge_name, int locked, int prefetch, const char *data, size_t len, int ok);
 
 /* v6 game-load worker plumbing (see ra_client.c "Game-load worker" header).
  *

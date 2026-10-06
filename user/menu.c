@@ -44,6 +44,7 @@
 #include "utils.h"
 #include "math_utils.h"
 #include "ra/ra.h"
+#include "ra/ra_internal.h"   /* v34 F0: RA_LOG for the SLOW bracket in AdrenalineDraw */
 #include "../adrenaline_version.h"
 
 #include "includes/lcd3x_v.h"
@@ -95,6 +96,10 @@ static char ra_mode_line[64] = "";
  * bottom info line the CFW/filter notes use (FONT_Y_LINE(17)) while the
  * entry is selected. Set by ToggleRaHardcore(); empty until first press. */
 static char ra_hardcore_status[96] = "";
+
+/* v34 F0: rate-limited SLOW bracket around ra_badges_upload_pending()
+ * (count + max per 5 s window, not a line per frame). */
+static uint32_t ra_slow_upload_n, ra_slow_upload_max, ra_slow_upload_next;
 
 // RGB colors for the filter box used by f.lux
 static float flux_colors[] = {
@@ -867,7 +872,29 @@ int AdrenalineDraw(SceSize args, void *argp) {
 		// Still above vita2d_start_drawing() on every path, so the function's
 		// documented "outside any GXM scene" precondition is preserved
 		// verbatim; it self-gates to an 8-iteration .bss scan when idle.
-		ra_badges_upload_pending();
+		{
+			// v34 F0: render-thread cost bracket -- 4 ms is a quarter of a 60 Hz
+			// frame. Rate-limited to one line per 5 s (count + max), so a
+			// chronically slow upload window cannot flood the user log.
+			uint32_t t0 = ra_log_ms();
+			int ra_up_events = ra_badges_upload_pending();
+			uint32_t dt = ra_log_ms() - t0;
+			// v41: every upload frame feeds the PERF counters (not only slow
+			// ones); ra_perf_note_upload returns at once when events == 0.
+			ra_perf_note_upload(ra_up_events, dt);
+			if (dt > 4) {
+				ra_slow_upload_n++;
+				if (dt > ra_slow_upload_max)
+					ra_slow_upload_max = dt;
+			}
+			if (ra_slow_upload_n && ra_log_ms() >= ra_slow_upload_next) {
+				RA_LOG_HOT(RA_HOT_SLOW, "[RA] SLOW ra_badges_upload_pending n=%u max=%ums (5s window)\n",
+					ra_slow_upload_n, ra_slow_upload_max);
+				ra_slow_upload_n = 0;
+				ra_slow_upload_max = 0;
+				ra_slow_upload_next = ra_log_ms() + 5000;
+			}
+		}
 
 		if ((sceCommonDialogIsRunning() && !ra_is_ime_active()) || (config.graphics_filtering == 0 && menu_open == 0 && draw_native == 0 && !ra_toast_is_active())) {
 			sceDisplayWaitVblankStart();

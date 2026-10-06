@@ -47,3 +47,7 @@ build-*.log
 
 # editor / tooling metadata
 .serena/
+
+# allow self-hosted release binaries, but keep stray build VPKs ignored
+!releases/
+!releases/*.vpk

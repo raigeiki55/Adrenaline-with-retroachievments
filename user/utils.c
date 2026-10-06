@@ -40,18 +40,108 @@ Pad hold_count, hold2_count;
 
 int SCE_CTRL_ENTER = SCE_CTRL_CROSS, SCE_CTRL_CANCEL = SCE_CTRL_CIRCLE;
 
+/* v40: the shared log fd. -1 = not attempted yet; -2 = open FAILED (degrade
+ * silently, never retry -- a per-call retry would reintroduce the open cost
+ * this change removes, and logging must never break the app); >= 0 = open. */
+static SceUID ra_log_fd = -1;
+
+static SceUID ra_log_open(void)
+{
+	/* v40: open once, lazily; the fd is kept for the process lifetime.
+	 * Concurrent first users race benignly: each opens its own fd; whichever
+	 * arrives first claims the slot (a SUCCESS may claim the slot from an
+	 * untried -1 OR from a failed -2 -- the failed latch must not beat a real
+	 * fd), any loser's fd is closed immediately (no leak, no torn fd --
+	 * SceUID is an int, reads are not torn). A failed open parks the sentinel
+	 * at -2 so no later call pays the open again; only a success can reclaim
+	 * it. */
+	if (ra_log_fd == -1) {
+		SceUID fd = sceIoOpen("ux0:data/adrenaline_user_log.txt",
+			SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+		if (fd >= 0) {
+			if (!__sync_bool_compare_and_swap(&ra_log_fd, -1, fd) &&
+				!__sync_bool_compare_and_swap(&ra_log_fd, -2, fd))
+				sceIoClose(fd);   /* a real fd already won: keep it */
+		} else {
+			__sync_bool_compare_and_swap(&ra_log_fd, -1, -2);
+		}
+	}
+	return (ra_log_fd >= 0) ? ra_log_fd : -1;
+}
+
+/* v41: bounded re-open after a failed write (V41-PLAN.md §4). Only CAS
+ * winners increment ra_log_reopens, atomically; two winners on successive fds
+ * can both pass the bound check, so the bound is RA_LOG_REOPEN_MAX, +1 under
+ * that race (v41-audit.md I6). */
+#define RA_LOG_REOPEN_MAX 3
+static volatile int ra_log_reopens = 0;
+static volatile unsigned int ra_log_write_errs = 0;
+
+unsigned int ra_log_write_errors(void)
+{
+	return ra_log_write_errs;
+}
+
+/* v41: the failed-write path, out of line so its note[] and temporaries are
+ * not in debugPrintf's frame -- debugPrintf runs on foreign pspemu/POPS
+ * threads (main.c, pops.c) and every call would otherwise pay them
+ * (v41-audit.md S2). The failed line is rewritten BEFORE the marker so the
+ * timestamps stay monotonic for parse.py's session split (audit I1). */
+static __attribute__((noinline)) void ra_log_write_failed(SceUID fd, int w, const char *string, int len)
+{
+	__sync_fetch_and_add(&ra_log_write_errs, 1);
+	if (ra_log_reopens < RA_LOG_REOPEN_MAX &&
+		__sync_bool_compare_and_swap(&ra_log_fd, fd, -1)) {
+		SceUID nfd;
+		int reopen = __sync_add_and_fetch(&ra_log_reopens, 1);
+		nfd = ra_log_open();   /* -1 -> real fd, or -> -2 latch on failure */
+		if (nfd >= 0) {
+			char note[128];
+			uint32_t ms;
+			int n;
+			sceIoWrite(nfd, string, len);
+			ms = (uint32_t)(sceKernelGetProcessTimeWide() / 1000);
+			n = snprintf(note, sizeof(note),
+				"[%u.%03u] [RA] v41 log fd re-opened after write error 0x%08X (reopen %d/%d)\n",
+				ms / 1000u, ms % 1000u, (unsigned)w, reopen, RA_LOG_REOPEN_MAX);
+			if (n > 0)
+				sceIoWrite(nfd, note, n);
+		}
+	}
+}
+
 int debugPrintf(char *text, ...) {
 	va_list list;
 	char string[512];
 
 	va_start(list, text);
-	vsprintf(string, text, list);
+	vsnprintf(string, sizeof(string), text, list);   /* v34 F0: vsprintf was unbounded on a 512-byte stack buffer */
 	va_end(list);
 
-	SceUID fd = sceIoOpen("ux0:data/adrenaline_user_log.txt", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+	/* v40: one kept fd, write per line. The log's consumers read it after a
+	 * crash, so there is deliberately NO buffering layer: sceIoWrite is
+	 * unbuffered (no stdio layer above it), so the per-line write IS the
+	 * flush -- the RetroArch/PPSSPP/DuckStation fputs/fwrite+fflush pattern
+	 * with stdio's userspace buffer removed. Durability trade, stated: a
+	 * per-line close committed every line to the device, so a hard-freeze
+	 * tail loss is now POSSIBLE where the old pattern could not lose a
+	 * written line; this is falsifiable by construction -- if a future crash
+	 * log ends early, this change is the first suspect. Per-line atomicity:
+	 * a single sceIoWrite request is serialized by the IO manager, so
+	 * concurrent writers (render/worker/boot/chime) never tear a line; only
+	 * the inter-line ORDER is arbitrary, same as before. No close call site
+	 * exists: the .suprx is torn down by the kernel on module unload and the
+	 * fd dies with the process (no orderly shutdown path on this side).
+	 * v41: a failed write is counted (PERF werr=) and triggers at most 3
+	 * re-opens; a re-open rewrites the failed line and then a `v41 log fd
+	 * re-opened` marker, so a mid-session gap is visible instead of looking
+	 * like a quit. */
+	SceUID fd = ra_log_open();
 	if (fd >= 0) {
-		sceIoWrite(fd, string, strlen(string));
-		sceIoClose(fd);
+		int len = (int)strlen(string);
+		int w = sceIoWrite(fd, string, len);
+		if (w < 0)
+			ra_log_write_failed(fd, w, string, len);
 	}
 
 	return 0;

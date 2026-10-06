@@ -21,6 +21,10 @@ full PSP 6.61 custom firmware via the taiHEN framework / ePSP.
 - **Unlock notifications** — toast + synthesized chime on achievement earned, during gameplay.
 - **Offline queueing** — unlocks are cached and synced when connectivity returns.
 - **Hardcore mode** (see below) with enforcement + a cheat-plugin gate.
+- **Low frame cost** — the hot-path logging that once cost the render thread ~13 ms *per line*
+  is now gated off by default. Measured on hardware: badge-upload frames land under one 60 Hz
+  frame **83%** of the time with the gate on, versus **18%** with full logging. See
+  [Verbose logging](#verbose-logging-debug) to turn it back on when you need it.
 
 ## Hardcore mode
 
@@ -54,6 +58,24 @@ or place a `ra_login.txt` credentials file at `ux0:data/PSPEMUCFW/`.
 On a fresh install, press **X** on the first boot prompt to auto-download the PSP 6.61 firmware
 (the bubble fetches it from Sony). If you prefer to supply it manually (e.g. for an offline
 install), place the firmware PBP at `ux0:data/PSPEMUCFW/661.PBP`.
+
+The current build is in [`releases/`](releases/) as `AdrenalinePlus-8.0.3-b1.vpk`.
+
+### Verbose logging (debug)
+
+Detailed logging is **off by default** — that is the point of the release, since those log
+lines cost the render thread roughly 13 ms each and show up as frame hitches while badges load.
+
+To turn it back on (for troubleshooting a bug report):
+
+1. Create an **empty file** at `ux0:data/PSPEMUCFW/ra_verbose_log` (no extension).
+2. **Fully restart** Adrenaline — the marker is read once at startup, so it takes effect on the
+   next launch, not immediately.
+3. To go back to the fast default, delete the file and restart again.
+
+The log itself is written to `ux0:data/adrenaline_user_log.txt` and is appended across
+sessions. The second line of each session records which mode it ran in:
+`v41 verbose-log=1 (marker file present)` or `=0 (marker file absent)`.
 
 ## License
 

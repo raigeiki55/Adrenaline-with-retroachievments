@@ -108,3 +108,66 @@ not just `xmbctrl.prx`. Two further findings:
    compressed payload. The pack is reproducible run-to-run from identical sources (verified by
    touch+rebuild), so the v18 prx came from different inputs. **Use size (19,249 B) plus
    `psp-objdump -r ... patch_vsh.c.obj | grep -c _logmsg` == 0 as the release check instead.**
+
+---
+
+## Release 8.0.3-b1 (2026-10-06) — logging cost: measured, then gated
+
+Covers `v34`–`v41`, i.e. everything since the `v33` binary previously shipped here. The arc: a
+suspected GPU-fence stall turned out to be **our own logging**, and the fix came from measuring
+it rather than reasoning about it.
+
+**`user/utils.c` — the central change (`v40`, `v41`)**
+
+- **`v40`, persistent log descriptor.** `debugPrintf` used to do a full
+  `sceIoOpen(O_CREAT|O_APPEND)` + `sceIoWrite` + `sceIoClose` on `ux0:` **per call, on the
+  render thread**. Measured cost: **29.38 ms per log line** (least-squares over 26 isolated
+  events; 11.53 ms intercept). It now opens once and keeps the descriptor for the process
+  lifetime — measured **15.34 ms/line**, a 48% reduction, intercept unchanged. Deliberately
+  **unbuffered**: the write *is* the flush, so the log still survives a crash (RetroArch
+  removed its own buffer for exactly this reason).
+- **`v41`, the hot-path gate.** The residual ~13 ms/line is still logging, so the 12 hottest
+  call sites now sit behind `RA_LOG_HOT`, off unless the marker file
+  `ux0:data/PSPEMUCFW/ra_verbose_log` exists. The marker is read once at init, off the render
+  thread; the per-site cost is one load and a branch. **Measured on hardware: badge-upload
+  frames land under one 60 Hz frame 83% of the time with the gate on, versus 18% with full
+  logging** (mean 15.2 ms vs 22.5 ms). Worth roughly 2,400 render-thread lines ≈ 31 s over a
+  nine-hour capture.
+- **`v41`, write-return hardening.** A failed log write now reopens the descriptor up to three
+  times (CAS-guarded, atomic counter) instead of silently dropping every later line — a dead
+  descriptor previously looked exactly like the user quitting.
+- **`vsnprintf` replaces an unbounded `vsprintf`** into a 512-byte buffer (`v34`).
+
+**`user/ra/ra_client.c`, `ra_badges.c`, `ra_net.c`, `menu.c`**
+
+- **`v41`, telemetry that survives the gate.** The `SLOW` brackets are themselves hot-path
+  lines, so they are replaced by always-on counters emitted as one cumulative `[RA] PERF` line
+  every 60 s **from the net worker** — measuring now costs the render thread nothing. Session
+  totals come from the last `PERF` line; its `v=` field records which arm the session ran in.
+- **`v39`, trophy-list game-switch fix.** Switching games painted the previous game's trophy
+  list before re-validating it. The list now records the PSP identity at session adoption and
+  shows a neutral "Checking game…" rather than stale rows. The stale window was a **latency**
+  window, not a latch — the back-out-and-return workaround was effectively a stopwatch.
+- **`v34`, diagnosability.** Timestamps on every line, `rc_client_enable_logging()` at VERBOSE
+  (rcheevos had been failing silently), four *named* FIFO drop sites, real HTTP error bodies,
+  request ids, and rate-limited `SLOW <name> n= max=` brackets. This is what made the rest of
+  the work possible — before it, the mass-unlock and the lost unlock were invisible.
+- **`v34` P2** — badge prefetch writes bytes only, deferring decode and GPU upload.
+
+**`v38` — ScePspemu thread-priority chart.** A one-shot diagnostic logging every
+`sceKernelCreateThread` call after the hook installs (priority + affinity), to answer whether
+any emulator thread sat between the worker's priorities. Result: the 128–176 band is **empty**;
+all 40 charted threads sit at 64–125. Retained because an empty band is only meaningful
+together with its coverage boundary — threads created during ScePspemu's own module start are
+*not* charted.
+
+**`v35` — revert of `v34`'s worker-priority change.** Kept as a documented control arm. The
+comparison capture was never taken, so whether the priority change did real work against the
+draw thread remains **unmeasured**.
+
+**Withdrawn, never released:** `v36`, `v37`.
+
+**Provenance.** This release is built from the source in this tree: the `user/` files here are
+byte-identical to the tree the release was audited against (`user/ra/ra_net.c` =
+`1b30771f09d92053fc0ec0cbdbf364e505f1108360ee637c563699942e0e6c5f`), and the shipped VPK is
+`20ac051372751f9d5644992b7932a96bd39dd4715b22af1cb68ad9afead1f1c6`.

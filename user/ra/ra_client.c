@@ -48,6 +48,7 @@
 #include "rc_compat.h"
 #include "../main.h"
 #include "../utils.h"
+#include "../../adrenaline_version.h"   /* v34 build tag: ADRENALINE_VERSION_* */
 
 extern int menu_open; /* menu.c */
 
@@ -67,9 +68,42 @@ static int ra_game_loading = 0;
  * rcheevos. */
 static int ra_hardcore_active = 0;
 
+/* v34 F0: rate-limited SLOW brackets (ra_tick). Count + max per 5 s window
+ * instead of a line per frame: a chronically slow tick would otherwise emit
+ * 60 lines/s and bury the [RC]/DROP lines this phase exists to produce. */
+static uint32_t ra_slow_net_n, ra_slow_net_max, ra_slow_net_next;
+static uint32_t ra_slow_badges_n, ra_slow_badges_max, ra_slow_badges_next;
+
+/* v34 F1c: achievement ids that were ALREADY unlocked (softcore) when the game
+ * loaded. In hardcore, rcheevos re-arms these every session
+ * (rc_client.c:1451-1474) and re-awards them; the server demotes the POST to
+ * softcore (UA not yet allowlisted). We cannot stop the POST without the
+ * private can_submit_achievement_unlock hook (v35 F1); we CAN stop showing
+ * the user a fourth "Mercenary" toast. Display-only: the POST still goes out
+ * and is logged; nothing here changes what is submitted.
+ *
+ * Core category only: a re-awarded unofficial achievement still toasts
+ * (acceptable -- see rc_client.h category enums).
+ *
+ * FORWARD-COMPAT: this suppression keys on "was softcore-unlocked at load",
+ * which is safe only while the server demotes our hardcore POST. If RAdmin
+ * allowlists the UA, that same POST becomes a genuine first-time hardcore
+ * unlock and this code would suppress a legitimate toast -- revisit when the
+ * UA is allowlisted. */
+#define RA_PRE_UNLOCKED_MAX 512
+static uint32_t ra_pre_unlocked[RA_PRE_UNLOCKED_MAX];
+static int ra_pre_unlocked_count;
+static int ra_pre_unlocked_overflow;
+
 static char ra_game_hash[64];
 static char ra_status_message[160];
 static char ra_welcome[160];
+
+/* v39 Fix A: the PSP-side game identity (iso_path ? iso_path : filename, the
+ * same selection ra_hash_worker_job makes at :1174) that the currently loaded
+ * rc_client session was built from. Recorded at adoption in
+ * ra_load_game_callback(); compared by ra_psp_game_changed(). */
+static char ra_loaded_psp_path[256];
 
 static uint8_t *ra_psp_ram = NULL; /* cached PSP RAM mapping (0x88000000 base) */
 
@@ -166,6 +200,12 @@ static int ra_revalidate_game = 0;
  */
 static int ra_identify_retry = 0;
 
+/* v41: set together with ra_pending_game_load by the v26 identify-retry poll
+ * in ra_tick(), cleared after the next successfully queued hash job, so
+ * ra_start_game_load() gates only the poll's "queued" line (V41-PLAN.md §9
+ * C6/C7). Render-thread only. */
+static int ra_identify_poll = 0;
+
 volatile int ra_trophy_open_requested = 0;
 
 /* ------------------------------------------------------------------------- */
@@ -223,6 +263,71 @@ static rc_clock_t ra_get_time_millisecs(const rc_client_t *client)
 	(void)client;
 	/* microseconds -> milliseconds; monotonic process time */
 	return (rc_clock_t)(sceKernelGetProcessTimeWide() / 1000);
+}
+
+/* v34 F0: monotonic ms since process start for the RA_LOG prefix. Same clock
+ * rc_client uses (ra_get_time_millisecs), so log timestamps and rcheevos'
+ * retry scheduling are directly comparable. Called from the worker thread as
+ * well as the render thread; sceKernelGetProcessTimeWide is thread-safe. */
+uint32_t ra_log_ms(void)
+{
+	return (uint32_t)(sceKernelGetProcessTimeWide() / 1000);
+}
+
+/* v41: hot-path log gate + PERF counters (V41-PLAN.md §2-§3). */
+int ra_log_verbose = 0;                     /* §2.2 */
+uint32_t ra_log_hot_hits[RA_HOT_N];         /* §2.3; non-static */
+
+typedef struct { uint32_t n, sum_ms, max_ms; } ra_perf_acc;
+static ra_perf_acc ra_perf_up[4];       /* upload frames by events: [0]=1 [1]=2 [2]=3..6 [3]=7+ */
+static uint32_t    ra_perf_up1_hist[3]; /* events==1 frames: [0]<=16ms [1]17..33ms [2]>=34ms */
+static ra_perf_acc ra_perf_net;         /* ra_net_tick calls with dt > 4 ms (same test as SLOW) */
+static ra_perf_acc ra_perf_btick;       /* ra_badges_tick calls with dt > 4 ms */
+
+static void ra_perf_add(ra_perf_acc *a, uint32_t dt)
+{
+	a->n++;
+	a->sum_ms += dt;
+	if (dt > a->max_ms)
+		a->max_ms = dt;
+}
+
+/* v41: called from the AdrenalineDraw upload bracket (menu.c) with the
+ * number of frees+uploads ra_badges_upload_pending performed and its ms. */
+void ra_perf_note_upload(int events, uint32_t dt_ms)
+{
+	int b;
+	if (events <= 0)
+		return;                       /* fast path: nothing uploaded, no fence */
+	b = (events == 1) ? 0 : (events == 2) ? 1 : (events <= 6) ? 2 : 3;
+	ra_perf_add(&ra_perf_up[b], dt_ms);
+	if (events == 1)
+		ra_perf_up1_hist[(dt_ms <= 16) ? 0 : (dt_ms <= 33) ? 1 : 2]++;
+}
+
+/* v41: one cumulative counter line. Called ONLY from the net worker
+ * (ra_net_worker_main), never from the render thread, so it adds no
+ * render-thread log cost. Reads render-owned uint32 counters unlocked: each
+ * field is an atomic word load; fields may be up to one frame apart, which
+ * is irrelevant for cumulative telemetry. Field order is a contract with the
+ * analysis scripts -- append only, never reorder. */
+void ra_perf_emit(void)
+{
+	RA_LOG("[RA] PERF v=%d hot=%u,%u,%u,%u,%u,%u,%u,%u"
+		" up1=%u,%u,%u up2=%u,%u,%u up36=%u,%u,%u up7=%u,%u,%u"
+		" h1=%u,%u,%u net=%u,%u,%u bt=%u,%u,%u werr=%u\n",
+		ra_log_verbose,
+		(unsigned)ra_log_hot_hits[0], (unsigned)ra_log_hot_hits[1], (unsigned)ra_log_hot_hits[2],
+		(unsigned)ra_log_hot_hits[3], (unsigned)ra_log_hot_hits[4], (unsigned)ra_log_hot_hits[5],
+		(unsigned)ra_log_hot_hits[6], (unsigned)ra_log_hot_hits[7],
+		(unsigned)ra_perf_up[0].n, (unsigned)ra_perf_up[0].sum_ms, (unsigned)ra_perf_up[0].max_ms,
+		(unsigned)ra_perf_up[1].n, (unsigned)ra_perf_up[1].sum_ms, (unsigned)ra_perf_up[1].max_ms,
+		(unsigned)ra_perf_up[2].n, (unsigned)ra_perf_up[2].sum_ms, (unsigned)ra_perf_up[2].max_ms,
+		(unsigned)ra_perf_up[3].n, (unsigned)ra_perf_up[3].sum_ms, (unsigned)ra_perf_up[3].max_ms,
+		(unsigned)ra_perf_up1_hist[0], (unsigned)ra_perf_up1_hist[1], (unsigned)ra_perf_up1_hist[2],
+		(unsigned)ra_perf_net.n, (unsigned)ra_perf_net.sum_ms, (unsigned)ra_perf_net.max_ms,
+		(unsigned)ra_perf_btick.n, (unsigned)ra_perf_btick.sum_ms, (unsigned)ra_perf_btick.max_ms,
+		ra_log_write_errors());
 }
 
 /*
@@ -523,8 +628,10 @@ void ra_logout(void)
 	ra_stale_token = 0;
 	ra_pending_auto_login = 0;
 	ra_pending_game_load = 0;
+	ra_identify_poll = 0;       /* v41: not (or no longer) a poll job (audit S3) */
 	ra_load_deferred_pending = 0;
 	ra_game_loaded = 0;
+	ra_pre_unlocked_count = 0;   /* v34 F1c: no session left for the snapshot to describe */
 	ra_revalidate_game = 0;
 	ra_identify_retry = 0;   /* v26: no session left to re-identify for */
 	ra_welcome[0] = 0;
@@ -608,6 +715,7 @@ static void ra_login_callback(int result, const char *error_message, rc_client_t
 
 		/* after login, (re)load the current game */
 		ra_pending_game_load = 1;
+		ra_identify_poll = 0;       /* v41: not (or no longer) a poll job (audit S3) */
 	} else if (result == RC_INVALID_CREDENTIALS || result == RC_ACCESS_DENIED ||
 			result == RC_EXPIRED_TOKEN) {
 		/*
@@ -967,9 +1075,53 @@ static void ra_load_game_callback(int result, const char *error_message, rc_clie
 
 	if (result == RC_OK) {
 		ra_game_loaded = 1;
+		/* v39 Fix A: record the PSP-side identity this session belongs to, so
+		 * the next menu-open can tell "game switched" from "same game still
+		 * running" without waiting for the async re-hash (trophy-list
+		 * game-switch fix). Render-thread safe; mirrors the iso_path/filename
+		 * selection of ra_hash_worker_job so the two agree by construction. */
+		{
+			SceAdrenaline *adr = (SceAdrenaline *)ScePspemuConvertAddress(ADRENALINE_ADDRESS, KERMIT_INPUT_MODE, ADRENALINE_SIZE);
+			const char *psp_path = NULL;
+			ra_loaded_psp_path[0] = 0;
+			if (adr)
+				psp_path = adr->iso_path[0] ? adr->iso_path : adr->filename;
+			if (psp_path && psp_path[0])
+				strncpy(ra_loaded_psp_path, psp_path, sizeof(ra_loaded_psp_path) - 1);
+			ra_loaded_psp_path[sizeof(ra_loaded_psp_path) - 1] = 0;
+		}
+		/* v34 F1c: snapshot the already-unlocked set before the first
+		 * rc_client_do_frame of the new game can fire a trigger. Runs inside
+		 * the load callback, which rcheevos invokes from rc_client_idle at the
+		 * END of do_frame -- after this frame's trigger evaluation -- so the
+		 * snapshot always precedes the new game's first trigger check. */
+		ra_pre_unlocked_count = 0;
+		ra_pre_unlocked_overflow = 0;
+		{
+			rc_client_achievement_list_t *list = rc_client_create_achievement_list(client,
+				RC_CLIENT_ACHIEVEMENT_CATEGORY_CORE, RC_CLIENT_ACHIEVEMENT_LIST_GROUPING_LOCK_STATE);
+			if (list) {
+				uint32_t b, i;
+				for (b = 0; b < list->num_buckets; b++) {
+					for (i = 0; i < list->buckets[b].num_achievements; i++) {
+						const rc_client_achievement_t *a = list->buckets[b].achievements[i];
+						if (a->unlocked & RC_CLIENT_ACHIEVEMENT_UNLOCKED_SOFTCORE) {
+							if (ra_pre_unlocked_count < RA_PRE_UNLOCKED_MAX)
+								ra_pre_unlocked[ra_pre_unlocked_count++] = a->id;
+							else
+								ra_pre_unlocked_overflow = 1;
+						}
+					}
+				}
+				rc_client_destroy_achievement_list(list);
+			}
+		}
+		RA_LOG("[RA] v34 pre-unlocked snapshot n=%d overflow=%d hc=%d\n",
+			ra_pre_unlocked_count, ra_pre_unlocked_overflow, ra_is_hardcore());
 		/* v26: a ra_request_game_load() that raced an already-queued background
 		 * hash must not leave a stale pending flag behind. */
 		ra_pending_game_load = 0;
+		ra_identify_poll = 0;       /* v41: not (or no longer) a poll job (audit S3) */
 		const rc_client_game_t *game = rc_client_get_game_info(client);
 		const char *title = (game && game->title) ? game->title : ra_game_hash;
 		/* v32: mode indicator at game start (E2 of the RA compliance spec).
@@ -993,6 +1145,7 @@ static void ra_load_game_callback(int result, const char *error_message, rc_clie
 		ra_snapshot_save(ra_game_hash);
 	} else {
 		ra_game_loaded = 0;
+		ra_pre_unlocked_count = 0;   /* v34 F1c: no snapshot for a game that failed to load */
 		snprintf(ra_status_message, sizeof(ra_status_message), "Game load failed: %s",
 			error_message ? error_message : "unknown error");
 	}
@@ -1001,6 +1154,7 @@ static void ra_load_game_callback(int result, const char *error_message, rc_clie
 void ra_request_game_load(void)
 {
 	ra_pending_game_load = 1;
+	ra_identify_poll = 0;       /* v41: not (or no longer) a poll job (audit S3) */
 }
 
 /*
@@ -1035,6 +1189,34 @@ void ra_note_menu_closed(void)
 int ra_needs_game_revalidate(void)
 {
 	return ra_revalidate_game;
+}
+
+/*
+ * v39 Fix A (trophy-list game-switch fix): compare the PSP-side game identity
+ * that is sitting in the Kermit shared block RIGHT NOW against the identity
+ * the loaded session was recorded from at adoption. The PSP side republishes
+ * title/titleid/filename/iso_path on every PSP boot (game launch and
+ * return-to-XMB both fire PentazeminOnSystemBooted ->
+ * initAdrenalineInfo, cef/core/pentazemin/src/main.c:149), so a switch is
+ * visible here in microseconds -- no ISO hash, no network.
+ *
+ * Render-thread only (caller is ra_view_opened, one frame after menu.c:242
+ * already did the same ScePspemuConvertAddress). Conservative: returns 0
+ * when nothing was recorded yet, so behaviour matches the pre-v39 path.
+ */
+int ra_psp_game_changed(void)
+{
+	SceAdrenaline *adrenaline;
+	const char *psp_path = "";
+
+	if (!ra_loaded_psp_path[0])
+		return 0;
+
+	adrenaline = (SceAdrenaline *)ScePspemuConvertAddress(ADRENALINE_ADDRESS, KERMIT_INPUT_MODE, ADRENALINE_SIZE);
+	if (adrenaline)
+		psp_path = adrenaline->iso_path[0] ? adrenaline->iso_path : adrenaline->filename;
+
+	return strcmp(ra_loaded_psp_path, psp_path) != 0;
 }
 
 /*
@@ -1167,7 +1349,11 @@ static void ra_start_game_load(void)
 		 * handoff. With this, every transition in the login/game-load
 		 * pipeline is logged, so the last line before a crash names the
 		 * stage that faulted. */
-		RA_LOG("[RA] game load: hash job queued to worker\n");
+		if (ra_identify_poll)
+			RA_LOG_HOT(RA_HOT_POLL, "[RA] game load: hash job queued to worker\n");
+		else
+			RA_LOG("[RA] game load: hash job queued to worker\n");
+		ra_identify_poll = 0;
 		snprintf(ra_status_message, sizeof(ra_status_message), "Identifying game...");
 	} else {
 		/* retry on the next tick */
@@ -1209,6 +1395,7 @@ void ra_client_hash_done(const ra_fifo_entry *done)
 			RA_LOG("[RA] game gone (reason %d), unloading %s\n", done->hash_reason, ra_game_hash);
 			rc_client_unload_game(ra_client);
 			ra_game_loaded = 0;
+			ra_pre_unlocked_count = 0;   /* v34 F1c: stale snapshot must not apply to the next game */
 			ra_game_hash[0] = 0;
 			ra_view_rebuild_list();
 		}
@@ -1287,6 +1474,7 @@ void ra_client_hash_done(const ra_fifo_entry *done)
 		RA_LOG("[RA] game switch %s -> %s, unloading\n", prev_hash, ra_game_hash);
 		rc_client_unload_game(ra_client);
 		ra_game_loaded = 0;
+		ra_pre_unlocked_count = 0;   /* v34 F1c: stale snapshot must not apply to the next game */
 		ra_view_rebuild_list();
 	}
 
@@ -1327,12 +1515,47 @@ void ra_client_hash_done(const ra_fifo_entry *done)
 /* Events                                                                     */
 /* ------------------------------------------------------------------------- */
 
+/* v34 F1c helper: was this achievement id already softcore-unlocked when the
+ * game loaded? Linear scan over <= RA_PRE_UNLOCKED_MAX ids on an event that
+ * fires a few times per session -- fine. */
+static int ra_was_pre_unlocked(uint32_t id)
+{
+	int i;
+	for (i = 0; i < ra_pre_unlocked_count; i++)
+		if (ra_pre_unlocked[i] == id)
+			return 1;
+	return 0;
+}
+
 static void ra_event_handler(const rc_client_event_t *event, rc_client_t *client)
 {
 	(void)client;
 
 	switch (event->type) {
 	case RC_CLIENT_EVENT_ACHIEVEMENT_TRIGGERED:
+		/* v34 F0: event-side request identity -- pairs with the
+		 * "[RA] req -> ... id=r=awardachievement" line the worker logs. */
+		if (event->achievement)
+			RA_LOG("[RA] EVENT triggered id=%u unlocked=0x%x hc=%d \"%s\"\n",
+				event->achievement->id, (unsigned)event->achievement->unlocked,
+				ra_is_hardcore(), event->achievement->title);
+		if (event->achievement && ra_is_hardcore() && ra_was_pre_unlocked(event->achievement->id)) {
+			/* v34 F1c: re-award of a softcore-unlocked achievement in hardcore.
+			 * The POST has already been issued by rc_client (rc_client.c:6184)
+			 * and will be demoted server-side; do not toast/chime again. */
+			RA_LOG("[RA] F1c suppressed re-award display id=%u \"%s\"\n",
+				event->achievement->id, event->achievement->title);
+			ra_view_rebuild_list();
+			break;
+		} else if (event->achievement && ra_was_pre_unlocked(event->achievement->id)) {
+			/* v34 F1c: a casual-mode re-award of a pre-unlocked id. rcheevos
+			 * does not re-arm softcore-unlocked achievements in casual mode
+			 * (rc_client.c:1451-1474 only re-arms when hardcore is on), so this
+			 * is itself anomalous -- log it, do NOT suppress. */
+			RA_LOG("[RA] F1c ANOMALY casual re-award id=%u \"%s\"\n",
+				event->achievement->id, event->achievement->title);
+			/* fall through: normal display */
+		}
 		if (event->achievement) {
 			snprintf(ra_status_message, sizeof(ra_status_message), "Unlocked: %s", event->achievement->title);
 			/* surface the unlock as a toast over the game (queue handles bursts) */
@@ -1381,6 +1604,16 @@ static void ra_event_handler(const rc_client_event_t *event, rc_client_t *client
 	}
 }
 
+/* v34 F0: bridge rcheevos' own log into RA_LOG. rcheevos names the
+ * early-return branch that eats an award ("Error awarding achievement %u: %s,
+ * retrying in %u seconds", "Achievement %u unlock blocked by client", ...).
+ * We were discarding it. */
+static void ra_rc_log(const char *message, const rc_client_t *client)
+{
+	(void)client;
+	RA_LOG("[RC] %s\n", message ? message : "(null)");
+}
+
 /* ------------------------------------------------------------------------- */
 /* Lifecycle / tick                                                           */
 /* ------------------------------------------------------------------------- */
@@ -1390,12 +1623,33 @@ void ra_init(void)
 	if (ra_initialized)
 		return;
 
+	/* Build tag (v40, bumped per release): the first line of every capture
+	 * names the build, so a v41 log can never be mistaken for a v40 one. One
+	 * tag => one binary; the runtime verbose-log gate never varies it (it has
+	 * its own line below). Tag + app version only --
+	 * deliberately no credentials, no paths, nothing from ra_login.cfg. */
+	RA_LOG("[RA] build v41-trophy (app %d.%d.%d)\n",
+		ADRENALINE_VERSION_MAJOR, ADRENALINE_VERSION_MINOR, ADRENALINE_VERSION_MICRO);
+
+	/* v41: hot-path log gate. Presence of the marker IS the opt-in (same
+	 * idiom as ra_hardcore_opt_in_get); read once per launch, here, before
+	 * rc_client_create so its early return cannot skip it. ra_init runs on
+	 * the InitAdrenaline thread (main.c), not on AdrenalineDraw, so the stat
+	 * costs the render thread nothing. */
+	ra_log_verbose = ra_log_verbose_opt_in_get();
+	RA_LOG("[RA] v41 verbose-log=%d (marker file %s)\n", ra_log_verbose,
+		ra_log_verbose ? "present" : "absent");
+
 	ra_client = rc_client_create(ra_read_psp_memory, ra_server_call);
 	if (!ra_client)
 		return;
 
 	rc_client_set_event_handler(ra_client, ra_event_handler);
 	rc_client_set_get_time_millisecs_function(ra_client, ra_get_time_millisecs);
+	/* v34 F0: rcheevos names the early-return branch that eats an award
+	 * ("Error awarding achievement %u: %s, retrying in %u seconds",
+	 * "Achievement %u unlock blocked by client", ...). We were discarding it. */
+	rc_client_enable_logging(ra_client, RC_CLIENT_LOG_LEVEL_VERBOSE, ra_rc_log);
 	/* v32: Hardcore is applied ONCE, here, right after rc_client_create() and
 	 * before any game can exist (client->game is NULL), so
 	 * rc_client_enable_hardcore() takes its no-game branch
@@ -1411,7 +1665,8 @@ void ra_init(void)
 
 	ra_install_hash_callbacks(ra_client);
 
-	/* v24: create the bootstrap mutex HERE, on the render thread, before
+	/* v24: create the bootstrap mutex HERE, in ra_init (which runs on the
+	 * InitAdrenaline thread, not the render thread -- see the v41 note above), before
 	 * ra_start_boot_net() can create the worker that will contend for it --
 	 * so the creation itself is never racy. */
 	ra_net_init_locks();
@@ -1450,6 +1705,7 @@ void ra_shutdown(void)
 	ra_initialized = 0;
 	ra_logged_in = 0;
 	ra_game_loaded = 0;
+	ra_pre_unlocked_count = 0;   /* v34 F1c: process shutdown, snapshot goes with the session */
 	ra_revalidate_game = 0;
 	ra_identify_retry = 0;   /* v26 */
 }
@@ -1465,10 +1721,47 @@ void ra_tick(void)
 		return;
 
 	/* completions from the net worker (invokes rc_client server callbacks) */
-	ra_net_tick();
+	/* v34 F0: render-thread cost bracket -- 4 ms is a quarter of a 60 Hz
+	 * frame. Rate-limited to one line per 5 s (count + max), so a chronically
+	 * slow tick cannot bury the [RC]/DROP lines this phase exists to produce. */
+	{
+		uint32_t t0 = ra_log_ms();
+		ra_net_tick();
+		uint32_t dt = ra_log_ms() - t0;
+		if (dt > 4) {
+			ra_slow_net_n++;
+			if (dt > ra_slow_net_max)
+				ra_slow_net_max = dt;
+			ra_perf_add(&ra_perf_net, dt);
+		}
+		if (ra_slow_net_n && ra_log_ms() >= ra_slow_net_next) {
+			RA_LOG_HOT(RA_HOT_SLOW, "[RA] SLOW ra_net_tick n=%u max=%ums (5s window)\n",
+				ra_slow_net_n, ra_slow_net_max);
+			ra_slow_net_n = 0;
+			ra_slow_net_max = 0;
+			ra_slow_net_next = ra_log_ms() + 5000;
+		}
+	}
 
 	/* badge cache maintenance (LRU aging) */
-	ra_badges_tick();
+	{
+		uint32_t t0 = ra_log_ms();
+		ra_badges_tick();
+		uint32_t dt = ra_log_ms() - t0;
+		if (dt > 4) {
+			ra_slow_badges_n++;
+			if (dt > ra_slow_badges_max)
+				ra_slow_badges_max = dt;
+			ra_perf_add(&ra_perf_btick, dt);
+		}
+		if (ra_slow_badges_n && ra_log_ms() >= ra_slow_badges_next) {
+			RA_LOG_HOT(RA_HOT_SLOW, "[RA] SLOW ra_badges_tick n=%u max=%ums (5s window)\n",
+				ra_slow_badges_n, ra_slow_badges_max);
+			ra_slow_badges_n = 0;
+			ra_slow_badges_max = 0;
+			ra_slow_badges_next = ra_log_ms() + 5000;
+		}
+	}
 
 	/* trophy view upkeep (login IME polling, row refresh) */
 	ra_view_tick();
@@ -1523,6 +1816,7 @@ void ra_tick(void)
 			!ra_game_loading && !ra_game_loaded && ra_game_hash[0]) {
 		ra_load_deferred_pending = 0;
 		ra_pending_game_load = 0;
+		ra_identify_poll = 0;       /* v41: not (or no longer) a poll job (audit S3) */
 		ra_game_loading = 1;
 		RA_LOG("[RA] v24 deferred begin_load_game %s (hash was ready before login)\n", ra_game_hash);
 		rc_client_begin_load_game(ra_client, ra_game_hash, ra_load_game_callback, NULL);
@@ -1563,6 +1857,7 @@ void ra_tick(void)
 		 * and the PSP world is paused) and the branch clears the pending flag
 		 * on its first hit anyway. */
 		ra_pending_game_load = 0;
+		ra_identify_poll = 0;       /* v41: not (or no longer) a poll job (audit S3) */
 		snprintf(ra_status_message, sizeof(ra_status_message), "Not logged in. Select Trophies > Login.");
 	}
 
@@ -1593,6 +1888,7 @@ void ra_tick(void)
 			ra_identify_retry_ticks = 0;
 			ra_identify_retry = 0;
 			ra_pending_game_load = 1;   /* the Option-B gate above queues it */
+			ra_identify_poll = 1;       /* v41: gate that job's "queued" line */
 		}
 	}
 
@@ -1672,6 +1968,14 @@ int ra_hardcore_opt_in_get(void)
 {
 	SceIoStat stat;
 	return sceIoGetstat(RA_HARDCORE_CFG, &stat) >= 0;
+}
+
+/* v41: presence of the marker file IS the verbose-log opt-in. Read once per
+ * launch (ra_init). No setter: the user creates/deletes the file. */
+int ra_log_verbose_opt_in_get(void)
+{
+	SceIoStat stat;
+	return sceIoGetstat(RA_VERBOSE_LOG_CFG, &stat) >= 0;
 }
 
 /* File operations ONLY — these never call rc_client_set_hardcore_enabled.

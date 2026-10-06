@@ -125,6 +125,21 @@
 #include "../utils.h"
 #include "../../adrenaline_version.h"   /* v32: ADRENALINE_VERSION_*_STR for the UA */
 
+/* v34 F0: first bytes of the POST body identify the request kind
+ * ("r=awardachievement&...", "r=ping&...", "r=patch&...") without logging
+ * the token. rc_api puts "r=" first and "t=<token>" later, so 24 bytes is
+ * safe; if that ever changes, shrink RA_POST_ID_LEN. */
+#define RA_POST_ID_LEN 24
+static void ra_post_id(const char *post_data, char out[RA_POST_ID_LEN + 1])
+{
+	size_t i = 0;
+	if (post_data) {
+		for (; i < RA_POST_ID_LEN && post_data[i] && post_data[i] != '&'; i++)
+			out[i] = post_data[i];
+	}
+	out[i] = 0;
+}
+
 /*
  * Per-stage bootstrap failure codes.
  *
@@ -165,8 +180,10 @@
 #define RA_HTTP_MAX_REDIRECTS       5L
 
 /* v32: the UA version now tracks the app version (RA compliance Section C:
- * "numeric and incrementing"). Resolves to AdrenalinePlus-RA/8.0.2 today and
- * follows every future bump of adrenaline_version.h automatically. The
+ * "numeric and incrementing"). Resolves to AdrenalinePlus-RA/8.0.3 today and
+ * follows every future bump of adrenaline_version.h automatically. v34 note:
+ * v33 and v34 deliberately SHARE this string (no bump mid-allowlist-request);
+ * make the UA increment per release once RAdmin validation completes (v35). The
  * product name is unchanged (still unique — G5/G6). adrenaline_version.h
  * defines function-like str()/xstr() macros; verified at v31 that this file
  * has zero str(/xstr( identifiers, so nothing collides. The single
@@ -809,6 +826,26 @@ static int ra_net_ensure_started_locked(void)
 	ra_net_started = 1;
 
 	ra_worker_stop = 0;
+	/* v35 P1 revert: priority 0x80 — above AdrenalineDraw (0xA0, main.c
+	 * InitAdrenaline) and above RA_BootNet (0xB0, ra_client.c
+	 * ra_start_boot_net), equal to RA_Chime (0x80, ra_chime.c ra_chime_init);
+	 * restores the v33 ordering. The worker does not
+	 * hard-spin: it sleeps 10 ms when idle and 1 ms when the completion FIFO is
+	 * full. Its CPU-bound phases (ISO hashing) do not voluntarily yield.
+	 * v38 thread chart (project memory; no filed report; the v40 capture
+	 * shows the same 40 names): every charted ScePspemu/ScePops thread sits at
+	 * priority 64-125, i.e. above this worker at both 0x80 (128) and 0xB0
+	 * (176); no CHARTED emulator thread is in the 128-176 band. Coverage: the
+	 * chart covers threads created after the hook installs (no OVERFLOW);
+	 * threads created during ScePspemu's own module start are not covered, so
+	 * the band is empty only among charted threads. Among this module's own
+	 * threads, 0x80 vs 0xB0 does change order: AdrenalineDraw (0xA0) above vs
+	 * below, RA_Chime (0x80) equal vs below it, RA_BootNet (0xB0, boot-only)
+	 * above vs equal. (AdrenalinePowerTick's 0x10000100 is an encoded default
+	 * whose resolved priority is UNVERIFIED; it may also lie in the band.)
+	 * Whether hashing at 0x80 preempts the draw thread is UNMEASURED: the v35
+	 * re-hash capture that would compare it was never taken. Vita: lower
+	 * number = higher priority. */
 	ra_worker_thread = sceKernelCreateThread("RA_NetWorker", ra_net_worker_main, 0x80,
 		RA_WORKER_STACK_SIZE, 0, 0, NULL);
 	if (ra_worker_thread < 0) {
@@ -1210,9 +1247,19 @@ void ra_server_call(const rc_api_request_t *request, rc_client_server_callback_t
 
 	if (!ra_net_started || ra_net_ensure_started() != 0 || !ra_net_is_online()) {
 		/* Deliver a retryable client error so rc_client schedules a retry. */
+		/* v34 F0: this was the silent offline drop (rc_client_create contract:
+		 * "body" carries the error message; we passed NULL). */
+		{
+			char id[RA_POST_ID_LEN + 1];
+			ra_post_id(request->post_data, id);
+			RA_LOG("[RA] DROP server_call offline id=%s started=%d online=%d\n",
+				id, ra_net_started, ra_net_is_online());
+		}
 		if (callback) {
 			rc_api_server_response_t response;
 			memset(&response, 0, sizeof(response));
+			response.body = "adrenaline: network offline";
+			response.body_length = strlen(response.body);
 			response.http_status_code = RC_API_SERVER_RESPONSE_RETRYABLE_CLIENT_ERROR;
 			callback(&response, callback_data);
 		}
@@ -1221,9 +1268,18 @@ void ra_server_call(const rc_api_request_t *request, rc_client_server_callback_t
 
 	entry = ra_fifo_produce_begin(&ra_work_fifo);
 	if (!entry) {
+		/* v34 F0: the silent FIFO-full drop. Separate log line from the
+		 * offline drop above -- they are different bugs with different fixes. */
+		{
+			char id[RA_POST_ID_LEN + 1];
+			ra_post_id(request->post_data, id);
+			RA_LOG("[RA] DROP server_call fifo_full id=%s\n", id);
+		}
 		if (callback) {
 			rc_api_server_response_t response;
 			memset(&response, 0, sizeof(response));
+			response.body = "adrenaline: work fifo full";
+			response.body_length = strlen(response.body);
 			response.http_status_code = RC_API_SERVER_RESPONSE_RETRYABLE_CLIENT_ERROR;
 			callback(&response, callback_data);
 		}
@@ -1247,22 +1303,29 @@ void ra_server_call(const rc_api_request_t *request, rc_client_server_callback_t
  * ENTRY POINT 2 of 3. Render thread producer; the GET itself runs on the worker
  * via ra_http_get -> ra_curl_request.
  */
-int ra_net_fetch_badge(const char *url, const char *badge_name, int locked)
+int ra_net_fetch_badge(const char *url, const char *badge_name, int locked, int prefetch)
 {
 	ra_fifo_entry *entry;
 
-	if (!ra_net_started || ra_net_ensure_started() != 0 || !ra_net_is_online())
+	if (!ra_net_started || ra_net_ensure_started() != 0 || !ra_net_is_online()) {
+		/* v34 F0: was a silent return 0 -- the caller treats it as
+		 * queue-full and marks the badge FAILED (short retry). */
+		RA_LOG_HOT(RA_HOT_BADGE_DROP, "[RA] DROP badge offline %s locked=%d\n", badge_name, locked);
 		return 0;
+	}
 
 	entry = ra_fifo_produce_begin(&ra_work_fifo);
-	if (!entry)
+	if (!entry) {
+		RA_LOG_HOT(RA_HOT_BADGE_DROP, "[RA] DROP badge fifo_full %s locked=%d\n", badge_name, locked);
 		return 0;
+	}
 
 	memset(entry, 0, sizeof(*entry));
 	entry->kind = RA_FIFO_BADGE_DONE;
 	entry->url = strdup(url);
 	strncpy(entry->badge_name, badge_name, sizeof(entry->badge_name) - 1);
 	entry->locked = locked;
+	entry->prefetch = prefetch;
 
 	ra_fifo_produce_commit(&ra_work_fifo);
 	return 1;
@@ -1317,6 +1380,25 @@ int ra_net_worker_main(unsigned int args, void *argp)
 	(void)argp;
 
 	while (!ra_worker_stop) {
+		/* v41: PERF heartbeat, every 60 s, from this thread so the render
+		 * thread pays no log line for it. The first pass only arms the timer.
+		 * Unconditional (not "only if changed"): the heartbeat doubles as a
+		 * liveness marker. The loop top is reached only between jobs, so one
+		 * request can delay it by up to RA_HTTP_TOTAL_TIMEOUT_SEC (30 s), more
+		 * under a hash job: a last PERF line more than about 95 s (60 s cadence
+		 * + the 30 s curl timeout) before the session's last line is suggestive
+		 * of an abnormal end (cf. v40 S09/S12/S14), not proof; no PERF line at
+		 * all means the worker never started. */
+		{
+			static uint32_t ra_perf_next = 0;
+			uint32_t now = ra_log_ms();
+			if (now >= ra_perf_next) {
+				if (ra_perf_next)
+					ra_perf_emit();
+				ra_perf_next = now + 60000;
+			}
+		}
+
 		ra_fifo_entry *work = ra_fifo_consume_begin(&ra_work_fifo);
 		if (!work) {
 			sceKernelDelayThread(10 * 1000);
@@ -1332,9 +1414,15 @@ int ra_net_worker_main(unsigned int args, void *argp)
 			 * A log that ends with "req ->" and never reaches "req <-" pins a
 			 * crash inside the worker's transport rather than on the render
 			 * thread. In v9 that transport is curl+OpenSSL, and ra_curl_request
-			 * logs its own "curl OK"/"curl FAIL" line in between. */
-			RA_LOG("[RA] req -> %s (post=%u)\n", work->url ? work->url : "(null)",
-				work->post_data ? (unsigned)strlen(work->post_data) : 0u);
+			 * logs its own "curl OK"/"curl FAIL" line in between. v34 F0 adds
+			 * id= (first POST field) so the wire request can be matched to the
+			 * EVENT triggered / DROP lines without reading the token. */
+			{
+				char id[RA_POST_ID_LEN + 1];
+				ra_post_id(work->post_data, id);
+				RA_LOG("[RA] req -> %s (post=%u id=%s)\n", work->url ? work->url : "(null)",
+					work->post_data ? (unsigned)strlen(work->post_data) : 0u, id);
+			}
 
 			body = ra_curl_request(work->url, work->post_data, work->content_type,
 				&body_len, &status);
@@ -1397,6 +1485,7 @@ int ra_net_worker_main(unsigned int args, void *argp)
 					done->body_length = body_len;
 					strncpy(done->badge_name, work->badge_name, sizeof(done->badge_name) - 1);
 					done->locked = work->locked;
+					done->prefetch = work->prefetch;
 					ra_fifo_produce_commit(&ra_completion_fifo);
 					body = NULL;
 					break;
@@ -1466,14 +1555,18 @@ void ra_net_tick(void)
 			response.body_length = done->body_length;
 			response.http_status_code = done->http_status;
 			/* v6 instrumentation: last render-thread line before rcheevos parses
-			 * the response and fires the rc_client callback (login result). */
+			 * the response and fires the rc_client callback (login result).
+			 * v40 note: deliberately NOT collapsed -- this is a crash locator,
+			 * not a progress report: a log that ENDS at this line pins a crash
+			 * inside the callback. A post-loop summary could not do that, and
+			 * with the persistent log fd the per-line cost is the write only. */
 			RA_LOG("[RA] cb dispatch status=%d len=%u\n", done->http_status,
 				(unsigned)done->body_length);
 			done->server_callback(&response, done->server_callback_data);
 		} else if (done->kind == RA_FIFO_BADGE_DONE) {
-			/* badge body delivered: decode + cache is handled by ra_badges.c */
-			extern void ra_badge_deliver(const char *badge_name, int locked, const char *data, size_t len, int ok);
-			ra_badge_deliver(done->badge_name, done->locked, done->body, done->body_length,
+			/* badge body delivered: decode + cache is handled by ra_badges.c
+			 * (prototype lives in ra_internal.h, next to ra_net_fetch_badge) */
+			ra_badge_deliver(done->badge_name, done->locked, done->prefetch, done->body, done->body_length,
 				done->http_status == 200 ? 1 : 0);
 		} else if (done->kind == RA_FIFO_HASH_JOB) {
 			/* v6: hash result back on the render thread; ra_client_hash_done

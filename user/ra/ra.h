@@ -33,6 +33,10 @@
  * toggle only; deliberately NOT an AdrenalineConfig field (no struct growth,
  * no 7.17 migration touch). Delete the file to opt out. */
 #define RA_HARDCORE_CFG    "ux0:data/PSPEMUCFW/ra_hardcore"
+/* v41 — hot-path verbose-log opt-in marker. Same idiom as RA_HARDCORE_CFG:
+ * existence of this file IS the setting, read once in ra_init(), never
+ * re-read. Absent (default) => the 12 RA_LOG_HOT sites are silent. */
+#define RA_VERBOSE_LOG_CFG "ux0:data/PSPEMUCFW/ra_verbose_log"
 /* v26 — IME-free file-login fallback. Same data dir as ra_login.cfg. Format:
  *   username=...
  *   password=...
@@ -169,6 +173,18 @@ void ra_request_game_load(void);
 
 int ra_is_game_loaded(void);
 
+/* v39 Fix A: non-zero when the PSP-side game identity in the Kermit shared
+ * block (iso_path, falling back to filename -- the same selection
+ * ra_hash_worker_job makes) differs from the identity the currently loaded
+ * session was recorded from at adoption. Render-thread safe: one
+ * ScePspemuConvertAddress plus a strcmp, no I/O. Returns 0 (conservative)
+ * when nothing has been recorded yet. */
+int ra_psp_game_changed(void);
+
+/* v34 F0: monotonic ms since process start (RA_LOG prefix; SLOW brackets).
+ * Defined in ra_client.c. */
+uint32_t ra_log_ms(void);
+
 /* v32 — hardcore mode accessors.
  *
  * ra_is_hardcore() reads the LIVE rc_client state (not a cached flag), so it
@@ -185,6 +201,8 @@ int ra_is_game_loaded(void);
 int ra_is_hardcore(void);
 int ra_hardcore_opt_in_get(void);
 int ra_hardcore_opt_in_set(int enabled);
+/* v41: RA_VERBOSE_LOG_CFG presence. Read once in ra_init(); no setter. */
+int ra_log_verbose_opt_in_get(void);
 
 /* v15: called from ExitAdrenalineMenu(). The menu is closing, so the game that
  * was identified may exit, be swapped, or keep running -- flag the session for
@@ -273,8 +291,11 @@ int ra_badge_prefetch(const char *badge_name, int locked);
 /* Pre-draw GPU window: uploads decoded badges / destroys evicted textures.
  * MUST be called from the render loop BEFORE vita2d_start_drawing() and
  * never between start_drawing/end_drawing. Fences (sceGxmFinish) only when
- * it has work. */
-void ra_badges_upload_pending(void);
+ * it has work.
+ * v41: returns the number of events it performed (deferred frees + pending
+ * slots processed, including a failed texture create); 0 on the fast path.
+ * The caller feeds it to ra_perf_note_upload() for the PERF counters. */
+int ra_badges_upload_pending(void);
 
 /* Offline snapshot --------------------------------------------------------- */
 

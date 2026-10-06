@@ -45,6 +45,10 @@ typedef struct ra_badge_slot {
 static ra_badge_slot ra_badge_cache[RA_BADGE_CACHE_MAX];
 static uint32_t ra_badge_tick_counter = 0;
 
+/* v34 A1: set only around the ra_badge_get() call in ra_badge_prefetch().
+ * Render thread only, so a plain static is safe. */
+static int ra_badge_prefetch_mode;
+
 /* ------------------------------------------------------------------------- */
 /* v11 Fix A: pre-draw upload queue + deferred GPU free list                  */
 /* ------------------------------------------------------------------------- */
@@ -116,7 +120,7 @@ static unsigned char *ra_decode_png_rgba(const void *data, size_t size, unsigned
 	*w = *h = 0;
 	if (lodepng_decode32(&image, w, h, (const unsigned char *)data, size) != 0)
 		return NULL;
-	RA_LOG("[RA] badge decode %ux%u rc=ok\n", *w, *h);
+	RA_LOG_HOT(RA_HOT_BADGE_DECODE, "[RA] badge decode %ux%u rc=ok\n", *w, *h);
 	/* WARNING-2 guard. v21: RA game icons (RA_IMG_GAME_ICON, /Images/) are 96x96
 	 * today, so the existing 128 cap covers them and is intentionally left
 	 * unchanged rather than widened for every badge. If RA ever ships larger
@@ -393,9 +397,13 @@ void *ra_badge_get(const char *badge_name, int locked)
 			else
 				snprintf(url, sizeof(url), "https://retroachievements.org/Badge/%s%s.png",
 					badge_name, (locked == RA_IMG_BADGE_LOCKED) ? "_lock" : "");
-			RA_LOG("[RA] badge fetch %s variant=%d (req#%u)\n",
-				badge_name, locked, ++ra_badge_req_counter);
-			if (!ra_net_fetch_badge(url, badge_name, locked))     /* now returns int */
+			/* v41: advanced outside RA_LOG_HOT, whose args are evaluated only
+			 * in verbose mode, so the count never freezes when the gate is off
+			 * (v41-audit.md D3); v=1 numbering is identical to v40. */
+			unsigned req = ++ra_badge_req_counter;
+			RA_LOG_HOT(RA_HOT_BADGE_FETCH, "[RA] badge fetch %s variant=%d (req#%u)\n",
+				badge_name, locked, req);
+			if (!ra_net_fetch_badge(url, badge_name, locked, ra_badge_prefetch_mode))     /* now returns int */
 				ra_badge_mark_failed(badge_name, locked, RA_BADGE_QUEUE_RETRY);
 		}
 	}
@@ -466,22 +474,39 @@ int ra_badge_prefetch(const char *badge_name, int locked)
 	/* cold in both tiers: hand it to the normal state machine. It re-checks
 	 * memory and disk (both just missed), reserves the slot and queues the
 	 * download. Returns NULL by construction -- we want the side effect. */
+	ra_badge_prefetch_mode = 1;
 	ra_badge_get(badge_name, locked);
+	ra_badge_prefetch_mode = 0;
 	return 1;
 }
 
 /*
- * Delivery path (render thread): the worker downloaded the PNG body; persist
- * it to the disk cache and decode into a texture.
+ * v34 A1: release the slot a prefetch reserved in ra_badge_get() before
+ * ra_badge_deliver returns. Leaves the slot alone if the draw path raced the
+ * prefetch and already decoded a texture into it.
  */
-void ra_badge_deliver(const char *badge_name, int locked, const char *data, size_t len, int ok)
+static void ra_badge_release_slot(const char *badge_name, int locked)
+{
+	ra_badge_slot *slot = ra_badge_find(badge_name, locked);
+	if (slot && slot->state == RA_BADGE_FETCHING && slot->tex == NULL) {
+		slot->used = 0;
+		slot->state = RA_BADGE_EMPTY;
+	}
+}
+
+/*
+ * Delivery path (render thread): the worker downloaded the PNG body; persist
+ * it to the disk cache and decode into a texture. v34 A1: a prefetch-originated
+ * body stops after the disk write -- no decode, no GPU upload, slot released.
+ */
+void ra_badge_deliver(const char *badge_name, int locked, int prefetch, const char *data, size_t len, int ok)
 {
 	char path[256];
 	unsigned w = 0, h = 0;
 	unsigned char *rgba;
 
-	RA_LOG("[RA] badge deliver %s locked=%d len=%u ok=%d\n",
-		badge_name ? badge_name : "(null)", locked, (unsigned)len, ok);
+	RA_LOG_HOT(RA_HOT_BADGE_DELIVER, "[RA] badge deliver %s locked=%d len=%u ok=%d prefetch=%d\n",
+		badge_name ? badge_name : "(null)", locked, (unsigned)len, ok, prefetch);
 
 	if (!badge_name || !badge_name[0])
 		return;
@@ -493,6 +518,16 @@ void ra_badge_deliver(const char *badge_name, int locked, const char *data, size
 	/* persist for offline use */
 	ra_badge_path(path, sizeof(path), badge_name, locked);
 	ra_write_file(path, data, (int)len);
+
+	if (prefetch) {
+		/* v34 A1: prefetch = bytes on disk only. The slot reserved by
+		 * ra_badge_get() is released so it does not pin a 64-entry cache
+		 * line for a badge nobody is drawing; the draw path will re-read the
+		 * file (disk tier) and decode on demand. */
+		ra_badge_release_slot(badge_name, locked);
+		RA_LOG_HOT(RA_HOT_BADGE_DELIVER, "[RA] badge prefetched %s locked=%d len=%u\n", badge_name, locked, (unsigned)len);
+		return;
+	}
 
 	/* decode ONLY — no vita2d call here (Fix A) */
 	rgba = ra_decode_png_rgba(data, len, &w, &h);
@@ -520,21 +555,23 @@ void ra_badge_deliver(const char *badge_name, int locked, const char *data, size
  * This is the ONLY place in the badge subsystem that creates or destroys
  * GXM objects.
  */
-void ra_badges_upload_pending(void)
+int ra_badges_upload_pending(void)
 {
 	int i, have_uploads = 0;
+	int events = 0;   /* v41: frees + processed slots, for ra_perf_note_upload */
 
 	for (i = 0; i < RA_BADGE_PENDING_MAX; i++)
 		if (ra_badge_pending[i].busy) { have_uploads = 1; break; }
 	if (!have_uploads && ra_badge_free_count == 0)
-		return;                            /* fast path: nothing to do, no fence */
+		return 0;                          /* fast path: nothing to do, no fence */
 
 	vita2d_wait_rendering_done();          /* sceGxmFinish — the barrier menu.c already uses */
 
 	/* 1. deferred frees (eviction victims) */
 	for (i = 0; i < ra_badge_free_count; i++) {
-		RA_LOG("[RA] badge free tex=%p\n", (void *)ra_badge_free_list[i]);
+		RA_LOG_HOT(RA_HOT_BADGE_FREE, "[RA] badge free tex=%p\n", (void *)ra_badge_free_list[i]);
 		vita2d_free_texture(ra_badge_free_list[i]);
+		events++;
 	}
 	ra_badge_free_count = 0;
 
@@ -547,8 +584,9 @@ void ra_badges_upload_pending(void)
 		vita2d_texture *tex = vita2d_create_empty_texture(ra_badge_pending[i].w, ra_badge_pending[i].h);
 		vita2d_texture_set_alloc_memblock_type(prev);                            /* restore! */
 
-		RA_LOG("[RA] badge tex=%p %s locked=%d\n",
+		RA_LOG_HOT(RA_HOT_BADGE_TEX, "[RA] badge tex=%p %s locked=%d\n",
 			(void *)tex, ra_badge_pending[i].name, ra_badge_pending[i].locked);
+		events++;   /* counted whether or not the create succeeded */
 
 		if (tex) {
 			sceClibMemcpy(vita2d_texture_get_datap(tex), ra_badge_pending[i].rgba,
@@ -562,6 +600,8 @@ void ra_badges_upload_pending(void)
 		ra_badge_pending[i].rgba = NULL;
 		ra_badge_pending[i].busy = 0;
 	}
+
+	return events;
 }
 
 /* ------------------------------------------------------------------------- */
